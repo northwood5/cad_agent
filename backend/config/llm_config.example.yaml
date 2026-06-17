@@ -1,0 +1,45 @@
+# CAD Agent — LLM 配置模板
+# 使用方法:
+#   cp backend/config/llm_config.example.yaml backend/config/llm_config.yaml
+#   在 llm_config.yaml 中填入 api_key，或使用环境变量（见下方注释）
+#
+# 环境变量优先级高于 yaml 中的 api_key 字段:
+#   export OPENAI_API_KEY=sk-...
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   export DASHSCOPE_API_KEY=sk-...
+#   export DEEPSEEK_API_KEY=sk-...
+
+active_provider: openai
+
+providers:
+  openai:
+    provider: openai
+    model_name: gpt-4o
+    api_key: ""
+    base_url: null
+    stream: true
+
+  anthropic:
+    provider: anthropic
+    model_name: claude-sonnet-4-6
+    api_key: ""
+    base_url: null
+    stream: true
+
+  dashscope:
+    provider: dashscope
+    model_name: qwen-plus
+    api_key: ""
+    stream: true
+
+  deepseek:
+    provider: deepseek
+    model_name: deepseek-chat
+    api_key: ""
+    stream: true
+
+  ollama:
+    provider: ollama
+    model_name: qwen2.5:7b
+    base_url: "http://localhost:11434"
+    stream: true

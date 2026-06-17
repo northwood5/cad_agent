@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CAD Agent</title>
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════ Header ═══════════════════ -->
+<header>
+  <h1><span>CAD</span> Agent</h1>
+
+  <!-- Active LLM badge (populated by JS) -->
+  <div id="llm-badge" class="llm-badge" title="当前使用的 LLM">
+    <span class="llm-dot"></span>
+    <span id="llm-badge-text">—</span>
+  </div>
+
+  <div class="header-btns">
+    <button class="btn" id="btn-reset-view" title="重置 3D 视角">重置视角</button>
+    <button class="btn btn-danger" id="btn-new-session" title="清空场景并开始新会话">新会话</button>
+    <button class="btn btn-primary" id="btn-settings">LLM 设置</button>
+  </div>
+</header>
+
+<!-- ═══════════════════ Main ═══════════════════ -->
+<div class="main">
+  <div class="work-area">
+
+    <!-- ── 3D Viewer ── -->
+    <div id="viewer-panel">
+      <div id="viewer-toolbar">
+        <span class="toolbar-hint">拖拽旋转 · 滚轮缩放 · 右键平移</span>
+        <div class="toolbar-actions">
+          <button class="btn-sm" id="btn-download-stl" disabled title="下载当前模型 STL">⬇ STL</button>
+          <button class="btn-sm" id="btn-history-toggle" title="模型版本历史">历史</button>
+        </div>
+      </div>
+      <div id="viewer-canvas-wrap">
+        <div id="viewer-placeholder">
+          <div class="icon">⬡</div>
+          <div>向 Agent 描述你想创建的 CAD 模型</div>
+          <div style="font-size:11px;opacity:.6">模型生成后将在此处显示</div>
+        </div>
+      </div>
+
+      <!-- Model version history sidebar -->
+      <div id="history-panel" class="history-panel hidden">
+        <div class="history-header">
+          <span>模型历史</span>
+          <span id="history-close" class="history-close">×</span>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty">暂无历史记录</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Chat panel ── -->
+    <div id="chat-panel">
+      <div id="chat-messages"></div>
+      <div id="chat-input-bar">
+        <textarea
+          id="chat-input"
+          placeholder="描述你想要的 CAD 模型… (Enter 发送，Shift+Enter 换行)"
+          rows="1"
+        ></textarea>
+        <button id="send-btn" title="发送 (Enter)">
+          <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+        </button>
+      </div>
+    </div>
+
+  </div><!-- .work-area -->
+
+  <!-- ── Agent Trace ── -->
+  <div id="trace-panel">
+    <div id="trace-header">
+      <div class="dot" id="trace-dot"></div>
+      <span>Agent 推理过程</span>
+      <span id="trace-clear" title="清空日志">清空</span>
+    </div>
+    <div id="trace-log"></div>
+  </div>
+</div><!-- .main -->
+
+<!-- ═══════════════════ Settings Modal ═══════════════════ -->
+<div class="modal-overlay" id="modal-settings">
+  <div class="modal">
+    <div class="modal-title-row">
+      <h2>LLM 配置</h2>
+      <span id="modal-close" class="modal-close">×</span>
+    </div>
+
+    <div class="form-row">
+      <label>Provider</label>
+      <select id="cfg-provider">
+        <option value="openai">OpenAI  (gpt-4o / gpt-4.1 …)</option>
+        <option value="anthropic">Anthropic  (Claude Sonnet / Opus …)</option>
+        <option value="dashscope">DashScope  (Qwen-plus / Qwen-max …)</option>
+        <option value="deepseek">DeepSeek  (deepseek-chat / reasoner …)</option>
+        <option value="ollama">Ollama  (本地部署)</option>
+      </select>
+    </div>
+
+    <div class="form-row">
+      <label>Model Name</label>
+      <input id="cfg-model" type="text"
+        placeholder="e.g. gpt-4o / claude-sonnet-4-6 / deepseek-chat" />
+    </div>
+
+    <div class="form-row">
+      <label>
+        API Key &nbsp;
+        <span id="cfg-status" class="status-badge badge-err">未配置</span>
+      </label>
+      <input id="cfg-apikey" type="password"
+        placeholder="留空则保留现有 key" autocomplete="off" />
+    </div>
+
+    <div class="form-row">
+      <label>Base URL &nbsp;<small style="color:var(--text-muted)">(自定义端点 / Ollama 主机)</small></label>
+      <input id="cfg-baseurl" type="text"
+        placeholder="留空使用默认  |  Ollama: http://localhost:11434" />
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn" id="btn-modal-cancel">取消</button>
+      <button class="btn btn-primary" id="btn-save-config">保存并切换</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="/js/main.js"></script>
+</body>
+</html>

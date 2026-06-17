@@ -1,0 +1,27 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── CAD output (generated files, not source) ────────────────────────────────
+backend/output/
+
+# ── API Keys / secrets ──────────────────────────────────────────────────────
+.env
+.env.*
+backend/config/llm_config.yaml
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

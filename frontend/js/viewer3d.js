@@ -1,0 +1,143 @@
+/**
+ * viewer3d.js  —  Three.js STL viewer (local build, no CDN dependency).
+ */
+
+import * as THREE from './three.module.js';
+import { OrbitControls } from './OrbitControls.js';
+import { STLLoader } from './STLLoader.js';
+
+export class Viewer3D {
+  constructor(container) {
+    this._container = container;
+    this._mesh = null;
+    this._init();
+  }
+
+  _init() {
+    const W = this._container.clientWidth || 800;
+    const H = this._container.clientHeight || 600;
+
+    // Renderer
+    this._renderer = new THREE.WebGLRenderer({ antialias: true });
+    this._renderer.setPixelRatio(window.devicePixelRatio);
+    this._renderer.setSize(W, H);
+    this._renderer.shadowMap.enabled = true;
+    this._container.appendChild(this._renderer.domElement);
+
+    // Scene
+    this._scene = new THREE.Scene();
+    this._scene.background = new THREE.Color(0x0d1018);
+
+    // Grid
+    const grid = new THREE.GridHelper(200, 20, 0x1e2236, 0x1e2236);
+    this._scene.add(grid);
+
+    // Lights
+    this._scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+    const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir1.position.set(100, 150, 100);
+    dir1.castShadow = true;
+    this._scene.add(dir1);
+    const dir2 = new THREE.DirectionalLight(0x8ab4f8, 0.4);
+    dir2.position.set(-80, 60, -80);
+    this._scene.add(dir2);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.2);
+    fill.position.set(0, -100, 0);
+    this._scene.add(fill);
+
+    // Camera
+    this._camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 10000);
+    this._camera.position.set(60, 60, 60);
+
+    // Orbit controls
+    this._controls = new OrbitControls(this._camera, this._renderer.domElement);
+    this._controls.enableDamping = true;
+    this._controls.dampingFactor = 0.08;
+    this._controls.minDistance = 1;
+    this._controls.maxDistance = 5000;
+
+    // Resize observer
+    this._ro = new ResizeObserver(() => this._onResize());
+    this._ro.observe(this._container);
+
+    this._animate();
+  }
+
+  _animate() {
+    requestAnimationFrame(() => this._animate());
+    this._controls.update();
+    this._renderer.render(this._scene, this._camera);
+  }
+
+  _onResize() {
+    const W = this._container.clientWidth;
+    const H = this._container.clientHeight;
+    if (!W || !H) return;
+    this._camera.aspect = W / H;
+    this._camera.updateProjectionMatrix();
+    this._renderer.setSize(W, H);
+  }
+
+  loadSTL(url) {
+    const loader = new STLLoader();
+    loader.load(
+      url,
+      (geometry) => {
+        if (this._mesh) {
+          this._scene.remove(this._mesh);
+          this._mesh.geometry.dispose();
+          this._mesh.material.dispose();
+          this._mesh = null;
+        }
+        geometry.computeVertexNormals();
+        const mat = new THREE.MeshPhongMaterial({
+          color: 0x4f8ef7,
+          specular: 0x334466,
+          shininess: 60,
+          side: THREE.DoubleSide,
+        });
+        this._mesh = new THREE.Mesh(geometry, mat);
+        this._mesh.castShadow = true;
+        this._mesh.receiveShadow = true;
+        this._scene.add(this._mesh);
+        this._fitCamera();
+        const ph = document.getElementById('viewer-placeholder');
+        if (ph) ph.classList.add('hidden');
+      },
+      undefined,
+      (err) => console.error('STL load error:', err)
+    );
+  }
+
+  _fitCamera() {
+    if (!this._mesh) return;
+    const box = new THREE.Box3().setFromObject(this._mesh);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 10;
+    const dist = maxDim * 2.5;
+    this._controls.target.copy(center);
+    this._camera.position.set(
+      center.x + dist * 0.7,
+      center.y + dist * 0.7,
+      center.z + dist * 0.7
+    );
+    this._camera.near = maxDim * 0.001;
+    this._camera.far = maxDim * 200;
+    this._camera.updateProjectionMatrix();
+    this._controls.update();
+  }
+
+  resetView() { this._fitCamera(); }
+
+  clearModel() {
+    if (this._mesh) {
+      this._scene.remove(this._mesh);
+      this._mesh.geometry.dispose();
+      this._mesh.material.dispose();
+      this._mesh = null;
+    }
+    const ph = document.getElementById('viewer-placeholder');
+    if (ph) ph.classList.remove('hidden');
+  }
+}
