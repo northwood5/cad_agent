@@ -54,6 +54,8 @@ from agentscope.message import UserMsg
 
 from agent.cad_agent import build_agent, SUPPORTED_PROVIDERS
 
+from db import init_db, repository as repo
+
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -191,6 +193,9 @@ def _to_json(
 app = FastAPI(title="CAD Agent", version="0.1.0")
 app.add_middleware(CORSMiddleware,
                    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Initialise the SQLite persistence layer (users / projects / history).
+init_db()
 
 
 # ── WebSocket ───────────────────────────────────────────────────────────────
@@ -414,6 +419,80 @@ async def export_step(session_id: str):
         media_type="application/step",
         headers={"Content-Disposition": f'attachment; filename="{step_path.name}"'},
     )
+
+
+# ── REST: lightweight user management ───────────────────────────────────────
+
+@app.post("/api/users/login")
+async def user_login(body: dict):
+    """Get-or-create a user by username (no password — lightweight identity)."""
+    username = (body.get("username") or "").strip()
+    if not username:
+        return JSONResponse({"error": "username required"}, status_code=400)
+    user = repo.get_or_create_user(username)
+    return JSONResponse(user)
+
+
+@app.get("/api/users/{user_id}/projects")
+async def get_user_projects(user_id: int):
+    if repo.get_user(user_id) is None:
+        return JSONResponse({"error": "user not found"}, status_code=404)
+    return JSONResponse({"projects": repo.list_projects(user_id)})
+
+
+@app.post("/api/users/{user_id}/projects")
+async def create_user_project(user_id: int, body: dict):
+    if repo.get_user(user_id) is None:
+        return JSONResponse({"error": "user not found"}, status_code=404)
+    name = (body.get("name") or "未命名项目").strip()
+    project = repo.create_project(user_id, name)
+    return JSONResponse(project)
+
+
+# ── REST: project data (history) ────────────────────────────────────────────
+
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: int):
+    project = repo.get_project(project_id)
+    if project is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    return JSONResponse(project)
+
+
+@app.patch("/api/projects/{project_id}")
+async def patch_project(project_id: int, body: dict):
+    if repo.get_project(project_id) is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    name = (body.get("name") or "").strip()
+    if name:
+        repo.rename_project(project_id, name)
+    return JSONResponse(repo.get_project(project_id))
+
+
+@app.delete("/api/projects/{project_id}")
+async def remove_project(project_id: int):
+    repo.delete_project(project_id)
+    return JSONResponse({"status": "ok"})
+
+
+@app.get("/api/projects/{project_id}/messages")
+async def get_project_messages(project_id: int):
+    return JSONResponse({"messages": repo.list_messages(project_id)})
+
+
+@app.get("/api/projects/{project_id}/runs")
+async def get_project_runs(project_id: int):
+    return JSONResponse({"runs": repo.list_runs(project_id)})
+
+
+@app.get("/api/projects/{project_id}/scripts")
+async def get_project_scripts(project_id: int):
+    return JSONResponse({"scripts": repo.list_scripts(project_id)})
+
+
+@app.get("/api/projects/{project_id}/artifacts")
+async def get_project_artifacts(project_id: int):
+    return JSONResponse({"artifacts": repo.list_artifacts(project_id)})
 
 
 # ── Static frontend ─────────────────────────────────────────────────────────
