@@ -501,7 +501,9 @@ class ResetScene(ToolBase):
         return _auto_allow()
 
     async def __call__(self, **_: Any) -> ToolChunk:
-        # Delete the FreeCAD document so the next operation starts fresh
+        # Drop the live in-memory document, then delete the .FCStd on disk so
+        # the next operation starts fresh.
+        await freecad_bridge.fc_reset(self._scene.fc_doc_path)
         fc_doc = self._scene.fc_doc_path
         if fc_doc.exists():
             fc_doc.unlink()

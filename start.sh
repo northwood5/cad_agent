@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================
-# start.sh — Start the CAD Agent backend
+# start.sh — Start the CAx Agent backend (conda env with in-process FreeCAD)
 # ============================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$SCRIPT_DIR/venv"
 BACKEND="$SCRIPT_DIR/backend"
 
-# ---- Activate venv ----
-if [ ! -f "$VENV/bin/activate" ]; then
-  echo "[ERROR] venv not found at $VENV. Run setup first:"
-  echo "  python3 -m venv venv && venv/bin/pip install -r backend/requirements.txt"
+# ---- Locate the conda 'cax' env (in-process FreeCAD lives here) ----
+CONDA_ROOT="${CONDA_ROOT:-$HOME/miniforge3}"
+CAX_PY="$CONDA_ROOT/envs/cax/bin/python"
+if [ ! -x "$CAX_PY" ]; then
+  echo "[ERROR] conda env 'cax' not found at $CONDA_ROOT/envs/cax"
+  echo "  Create it with:"
+  echo "    conda create -y -n cax -c conda-forge python=3.11 freecad"
+  echo "    conda run -n cax pip install -r backend/requirements.txt"
   exit 1
 fi
-source "$VENV/bin/activate"
 
 # ---- Optional: load .env for API keys ----
 ENV_FILE="$SCRIPT_DIR/.env"
@@ -31,15 +33,11 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 echo ""
-echo "  ╔══════════════════════════════════╗"
-echo "  ║  CAD Agent  →  http://localhost:8000  ║"
-echo "  ╚══════════════════════════════════╝"
-echo ""
-echo "  设置 API Key 的三种方式:"
-echo "    1. 编辑 backend/config/llm_config.yaml"
-echo "    2. 在 .env 文件中: OPENAI_API_KEY=sk-..."
-echo "    3. 在前端页面 [LLM 设置] 中填写"
+echo "  ╔══════════════════════════════════════╗"
+echo "  ║  CAx Agent  →  http://localhost:8000  ║"
+echo "  ╚══════════════════════════════════════╝"
+echo "  FreeCAD: in-process (conda env 'cax')"
 echo ""
 
 cd "$BACKEND"
-exec uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+exec "$CAX_PY" -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload

@@ -1,38 +1,87 @@
 # -*- coding: utf-8 -*-
 """
-FreeCAD subprocess bridge.
+FreeCAD bridge — in-process (conda-forge build).
 
-FreeCAD snap uses Python 3.12; the project venv uses Python 3.14,
-so direct import is impossible. This module runs FreeCAD operations via
-`freecad.cmd` subprocess and communicates through JSON on stdout.
+The backend runs under a conda env (``cax``) whose Python matches the
+conda-forge FreeCAD build, so FreeCAD is imported directly instead of being
+shelled out to ``freecad.cmd``. Benefits over the old subprocess approach:
 
-Document mode (fc_*): all operations share a persistent .FCStd document
-per session. FreeCAD B-rep geometry is the source of truth; STL is
-exported for the 3-D viewer after every mutating call.
+  * no per-operation process startup,
+  * a live, in-memory ``FreeCAD.Document`` per project is kept hot and only
+    saved to disk after each mutation (the .FCStd still persists state and
+    feeds the on-demand STEP export / survives restarts).
+
+Concurrency: FreeCAD is not thread-safe, so every operation runs on a single
+dedicated worker thread (``_executor``) guarded by an ``asyncio.Lock`` — all
+FreeCAD access is therefore serialised and single-threaded, while the event
+loop stays responsive.
+
+The public async API (``fc_create_primitive`` / ``fc_boolean_op`` /
+``fc_transform`` / ``fc_export_stl`` / ``fc_export_step`` / ``stl_to_step`` /
+``fc_reset``) and the script-capture sink are unchanged, so upper layers
+(cad_tools, workflow_service) need no edits.
 """
+from __future__ import annotations
+
 import asyncio
+import concurrent.futures
 import contextvars
 import json
 import logging
-import tempfile
+import os
+import sys
 from pathlib import Path
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-FREECAD_CMD = "freecad.cmd"
-TIMEOUT = 60  # seconds per operation
+# ── FreeCAD bootstrap (conda-forge) ───────────────────────────────────────────
+_FC_AVAILABLE = False
+try:
+    # The conda-forge package ships a `freecad` shim that puts FreeCAD.so on
+    # sys.path; FreeCAD.so lives in <env>/lib. Point at it explicitly (works
+    # whether or not the conda env is "activated") to avoid a startup warning.
+    if "PATH_TO_FREECAD_LIBDIR" not in os.environ:
+        os.environ["PATH_TO_FREECAD_LIBDIR"] = str(Path(sys.prefix) / "lib")
+    import freecad  # noqa: F401  (bootstrap shim)
+    import FreeCAD  # type: ignore
+    import Part     # type: ignore
+    _FC_AVAILABLE = True
+    logger.info("FreeCAD %s imported in-process", ".".join(FreeCAD.Version()[:3]))
+except Exception as exc:  # pragma: no cover - depends on runtime env
+    logger.warning("In-process FreeCAD unavailable (%s); CAD will use trimesh", exc)
 
-# ── Script capture sink ───────────────────────────────────────────────────────
-# When set (by the workflow service for the duration of a node), every FreeCAD
-# script we are about to execute is reported to this callback so it can be shown
-# in the frontend's script-log tab and persisted.
+
+# Single dedicated thread so all FreeCAD C++ access happens on one thread.
+_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="freecad"
+)
+_lock = asyncio.Lock()
+
+# Live documents keyed by .FCStd path.
+_docs: dict[str, Any] = {}
+
+
+async def _run(func: Callable, *args) -> dict:
+    """Serialise and run a blocking FreeCAD call on the dedicated thread."""
+    if not _FC_AVAILABLE:
+        return {"success": False, "error": "FreeCAD not available in this environment"}
+    async with _lock:
+        loop = asyncio.get_running_loop()
+        try:
+            return await loop.run_in_executor(_executor, func, *args)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("FreeCAD operation crashed")
+            return {"success": False, "error": str(exc)}
+
+
+# ── Script capture sink (unchanged API) ───────────────────────────────────────
 _script_sink: contextvars.ContextVar = contextvars.ContextVar(
     "freecad_script_sink", default=None
 )
 
 
 def set_script_sink(fn):
-    """Register a callback ``fn(script: str)`` for captured FreeCAD scripts."""
     return _script_sink.set(fn)
 
 
@@ -40,63 +89,42 @@ def reset_script_sink(token) -> None:
     _script_sink.reset(token)
 
 
-# ── Low-level runner ─────────────────────────────────────────────────────────
-
-async def run_freecad_script(script: str) -> dict:
-    """Write *script* to a temp file and execute it inside freecad.cmd.
-
-    The freecad snap cannot access /tmp, so the script is placed in $HOME.
-    The last JSON line in stdout is parsed and returned as a dict.
-    """
+def _emit(script: str) -> None:
+    """Report a representative FreeCAD script for the UI script log."""
     sink = _script_sink.get()
     if sink is not None:
         try:
             sink(script)
-        except Exception:  # capturing must never break execution
+        except Exception:
             logger.debug("script sink raised", exc_info=True)
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix="fc_",
-        dir=Path.home(),
-    ) as f:
-        f.write(script)
-        script_path = f.name
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            FREECAD_CMD, script_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return {"success": False, "error": "FreeCAD operation timed out"}
+# ── Document helpers (run on the FreeCAD thread) ──────────────────────────────
 
-        output = stdout.decode("utf-8", errors="replace")
-        for line in reversed(output.strip().splitlines()):
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    pass
-
-        if proc.returncode != 0:
-            err = stderr.decode("utf-8", errors="replace")
-            logger.warning("FreeCAD stderr: %s", err[:400])
-            return {"success": False, "error": f"FreeCAD exited with code {proc.returncode}: {err[:200]}"}
-
-        return {"success": False, "error": "No JSON result from FreeCAD"}
-    finally:
-        Path(script_path).unlink(missing_ok=True)
+def _get_doc(doc_path: str):
+    doc = _docs.get(doc_path)
+    if doc is None:
+        if os.path.exists(doc_path):
+            doc = FreeCAD.openDocument(doc_path)
+        else:
+            doc = FreeCAD.newDocument("CADScene")
+        _docs[doc_path] = doc
+    return doc
 
 
-# ── Document-mode primitives ──────────────────────────────────────────────────
+def _save_doc(doc, doc_path: str) -> None:
+    if doc.FileName:
+        doc.save()
+    else:
+        doc.saveAs(doc_path)
+
+
+def _bounds(shape) -> list[list[float]]:
+    bb = shape.BoundBox
+    return [[bb.XMin, bb.YMin, bb.ZMin], [bb.XMax, bb.YMax, bb.ZMax]]
+
+
+# ── Create primitive ──────────────────────────────────────────────────────────
 
 async def fc_create_primitive(
     doc_path: Path,
@@ -112,77 +140,50 @@ async def fc_create_primitive(
     minor_radius: float = 3.0,
     fillet_radius: float = 0.0,
 ) -> dict:
-    """Create a primitive, add it to the session document, export STL."""
-    dp = str(doc_path)
-    sp = str(stl_path)
-    fr = fillet_radius
+    _emit(_script_create(name, shape_type, length, width, height, radius,
+                         major_radius, minor_radius, fillet_radius, doc_path, stl_path))
 
-    script = f"""
-import FreeCAD, Part, json, os
+    def work() -> dict:
+        doc = _get_doc(str(doc_path))
+        if doc.getObject(name):
+            doc.removeObject(name)
 
-doc_path = {dp!r}
-stl_path = {sp!r}
-name = {name!r}
+        if shape_type == "box":
+            shape = Part.makeBox(length, width, height)
+        elif shape_type == "cylinder":
+            shape = Part.makeCylinder(radius, height)
+        elif shape_type == "sphere":
+            shape = Part.makeSphere(radius)
+        elif shape_type == "cone":
+            shape = Part.makeCone(0, radius, height)
+        elif shape_type == "torus":
+            shape = Part.makeTorus(major_radius, minor_radius)
+        else:
+            return {"success": False, "error": f"Unknown shape_type: {shape_type}"}
 
-try:
-    if os.path.exists(doc_path):
-        doc = FreeCAD.openDocument(doc_path)
-    else:
-        doc = FreeCAD.newDocument("CADScene")
+        if fillet_radius and fillet_radius > 0 and shape_type in ("box", "cylinder"):
+            try:
+                if shape_type == "box":
+                    shape = shape.makeFillet(fillet_radius, shape.Edges)
+                else:
+                    circ = [e for e in shape.Edges if hasattr(e.Curve, "Radius")]
+                    if circ:
+                        shape = shape.makeFillet(fillet_radius, circ[:2])
+            except Exception:
+                pass  # radius too large — keep unfilleted
 
-    existing = doc.getObject(name)
-    if existing:
-        doc.removeObject(name)
+        obj = doc.addObject("Part::Feature", name)
+        obj.Shape = shape
+        doc.recompute()
+        _save_doc(doc, str(doc_path))
+        obj.Shape.exportStl(str(stl_path))
+        return {"success": True, "name": name, "stl_path": str(stl_path),
+                "bounds": _bounds(obj.Shape)}
 
-    shape_type = {shape_type!r}
-    if shape_type == "box":
-        shape = Part.makeBox({length}, {width}, {height})
-    elif shape_type == "cylinder":
-        shape = Part.makeCylinder({radius}, {height})
-    elif shape_type == "sphere":
-        shape = Part.makeSphere({radius})
-    elif shape_type == "cone":
-        shape = Part.makeCone(0, {radius}, {height})
-    elif shape_type == "torus":
-        shape = Part.makeTorus({major_radius}, {minor_radius})
-    else:
-        raise ValueError("Unknown shape_type: " + shape_type)
-
-    if {fr} > 0 and shape_type in ("box", "cylinder"):
-        try:
-            if shape_type == "box":
-                shape = shape.makeFillet({fr}, shape.Edges)
-            else:
-                circ = [e for e in shape.Edges if hasattr(e.Curve, "Radius")]
-                if circ:
-                    shape = shape.makeFillet({fr}, circ[:2])
-        except Exception:
-            pass  # proceed without fillet if radius too large
-
-    obj = doc.addObject("Part::Feature", name)
-    obj.Shape = shape
-    doc.recompute()
-
-    if os.path.exists(doc_path):
-        doc.save()
-    else:
-        doc.saveAs(doc_path)
-
-    obj.Shape.exportStl(stl_path)
-    bb = obj.Shape.BoundBox
-    print(json.dumps({{
-        "success": True,
-        "name": name,
-        "stl_path": stl_path,
-        "bounds": [[bb.XMin, bb.YMin, bb.ZMin], [bb.XMax, bb.YMax, bb.ZMax]],
-    }}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+    return await _run(work)
 
 
-# ── Boolean operations ────────────────────────────────────────────────────────
+# ── Boolean ───────────────────────────────────────────────────────────────────
 
 async def fc_boolean_op(
     doc_path: Path,
@@ -192,54 +193,36 @@ async def fc_boolean_op(
     shape_a: str,
     shape_b: str,
 ) -> dict:
-    """Perform a boolean operation between two named shapes in the document."""
     op_map = {"union": "fuse", "difference": "cut", "intersection": "common"}
     if operation not in op_map:
         return {"success": False, "error": f"Unknown operation: {operation!r}"}
     fc_op = op_map[operation]
+    _emit(_script_boolean(result_name, fc_op, shape_a, shape_b, doc_path, stl_path))
 
-    script = f"""
-import FreeCAD, Part, json, os
+    def work() -> dict:
+        doc = _get_doc(str(doc_path))
+        obj_a = doc.getObject(shape_a)
+        obj_b = doc.getObject(shape_b)
+        if obj_a is None:
+            return {"success": False, "error": f"Shape {shape_a!r} not found in document"}
+        if obj_b is None:
+            return {"success": False, "error": f"Shape {shape_b!r} not found in document"}
 
-doc_path = {str(doc_path)!r}
-stl_path = {str(stl_path)!r}
-result_name = {result_name!r}
+        result_shape = getattr(obj_a.Shape, fc_op)(obj_b.Shape)
+        if result_shape.isNull():
+            return {"success": False, "error": "Boolean result is null — shapes may not intersect"}
 
-try:
-    doc = FreeCAD.openDocument(doc_path)
+        if doc.getObject(result_name):
+            doc.removeObject(result_name)
+        new_obj = doc.addObject("Part::Feature", result_name)
+        new_obj.Shape = result_shape
+        doc.recompute()
+        _save_doc(doc, str(doc_path))
+        new_obj.Shape.exportStl(str(stl_path))
+        return {"success": True, "name": result_name, "stl_path": str(stl_path),
+                "bounds": _bounds(new_obj.Shape)}
 
-    obj_a = doc.getObject({shape_a!r})
-    obj_b = doc.getObject({shape_b!r})
-    if obj_a is None:
-        raise RuntimeError("Shape {shape_a!r} not found in document")
-    if obj_b is None:
-        raise RuntimeError("Shape {shape_b!r} not found in document")
-
-    result_shape = obj_a.Shape.{fc_op}(obj_b.Shape)
-    if result_shape.isNull():
-        raise RuntimeError("Boolean result is null — shapes may not intersect")
-
-    existing = doc.getObject(result_name)
-    if existing:
-        doc.removeObject(result_name)
-
-    new_obj = doc.addObject("Part::Feature", result_name)
-    new_obj.Shape = result_shape
-    doc.recompute()
-    doc.save()
-
-    new_obj.Shape.exportStl(stl_path)
-    bb = new_obj.Shape.BoundBox
-    print(json.dumps({{
-        "success": True,
-        "name": result_name,
-        "stl_path": stl_path,
-        "bounds": [[bb.XMin, bb.YMin, bb.ZMin], [bb.XMax, bb.YMax, bb.ZMax]],
-    }}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+    return await _run(work)
 
 
 # ── Transform ─────────────────────────────────────────────────────────────────
@@ -253,161 +236,177 @@ async def fc_transform(
     rotate_angle_deg: float | None = None,
     scale: float | list | None = None,
 ) -> dict:
-    """Apply translate / rotate / scale to a named shape in the document."""
-    translate_code = f"shape.translate(FreeCAD.Vector{tuple(translate)})" if translate else ""
-    rotate_code = ""
-    if rotate_axis and rotate_angle_deg is not None:
-        rotate_code = (
-            f"shape.rotate(FreeCAD.Vector(0,0,0), "
-            f"FreeCAD.Vector{tuple(rotate_axis)}, {rotate_angle_deg})"
-        )
-    scale_code = ""
-    if scale is not None:
-        if isinstance(scale, (int, float)):
-            scale_code = f"shape = shape.scale({float(scale)})"
-        else:
-            scale_code = (
-                f"m = FreeCAD.Matrix(); "
-                f"m.scale(FreeCAD.Vector{tuple(scale)}); "
-                f"shape = shape.transformGeometry(m)"
-            )
+    _emit(_script_transform(name, translate, rotate_axis, rotate_angle_deg, scale,
+                            doc_path, stl_path))
 
-    script = f"""
-import FreeCAD, Part, json, os
+    def work() -> dict:
+        doc = _get_doc(str(doc_path))
+        obj = doc.getObject(name)
+        if obj is None:
+            return {"success": False, "error": f"Shape {name!r} not found in document"}
 
-doc_path = {str(doc_path)!r}
-stl_path = {str(stl_path)!r}
-name = {name!r}
+        shape = obj.Shape.copy()
+        if translate:
+            shape.translate(FreeCAD.Vector(*translate))
+        if rotate_axis and rotate_angle_deg is not None:
+            shape.rotate(FreeCAD.Vector(0, 0, 0),
+                         FreeCAD.Vector(*rotate_axis), rotate_angle_deg)
+        if scale is not None:
+            if isinstance(scale, (int, float)):
+                shape = shape.scaled(float(scale)) if hasattr(shape, "scaled") else _scale_matrix(shape, [scale, scale, scale])
+            else:
+                shape = _scale_matrix(shape, scale)
 
-try:
-    doc = FreeCAD.openDocument(doc_path)
-    obj = doc.getObject(name)
-    if obj is None:
-        raise RuntimeError("Shape " + name + " not found in document")
+        obj.Shape = shape
+        doc.recompute()
+        _save_doc(doc, str(doc_path))
+        obj.Shape.exportStl(str(stl_path))
+        return {"success": True, "name": name, "stl_path": str(stl_path),
+                "bounds": _bounds(obj.Shape)}
 
-    shape = obj.Shape.copy()
-    {translate_code}
-    {rotate_code}
-    {scale_code}
+    return await _run(work)
 
-    obj.Shape = shape
-    doc.recompute()
-    doc.save()
 
-    obj.Shape.exportStl(stl_path)
-    bb = obj.Shape.BoundBox
-    print(json.dumps({{
-        "success": True,
-        "name": name,
-        "stl_path": stl_path,
-        "bounds": [[bb.XMin, bb.YMin, bb.ZMin], [bb.XMax, bb.YMax, bb.ZMax]],
-    }}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+def _scale_matrix(shape, factors):
+    m = FreeCAD.Matrix()
+    m.scale(FreeCAD.Vector(*factors))
+    return shape.transformGeometry(m)
 
 
 # ── Export ────────────────────────────────────────────────────────────────────
 
-async def fc_export_stl(doc_path: Path, output_stl: Path) -> dict:
-    """Merge all shapes in the document and export as STL."""
-    script = f"""
-import FreeCAD, Part, json, os
-
-doc_path = {str(doc_path)!r}
-output_stl = {str(output_stl)!r}
-
-try:
-    doc = FreeCAD.openDocument(doc_path)
+def _merged_shapes(doc):
     shapes = [o.Shape for o in doc.Objects
               if o.TypeId == "Part::Feature" and not o.Shape.isNull()]
     if not shapes:
-        raise RuntimeError("No shapes in document")
-    merged = shapes[0] if len(shapes) == 1 else Part.makeCompound(shapes)
-    merged.exportStl(output_stl)
-    print(json.dumps({{"success": True, "path": output_stl}}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+        return None
+    return shapes[0] if len(shapes) == 1 else Part.makeCompound(shapes)
+
+
+async def fc_export_stl(doc_path: Path, output_stl: Path) -> dict:
+    _emit(f"# 导出 STL\nimport FreeCAD, Part\n"
+          f"doc = FreeCAD.openDocument({str(doc_path)!r})\n"
+          f"# 合并所有 Part::Feature 后 exportStl({str(output_stl)!r})")
+
+    def work() -> dict:
+        doc = _get_doc(str(doc_path))
+        merged = _merged_shapes(doc)
+        if merged is None:
+            return {"success": False, "error": "No shapes in document"}
+        merged.exportStl(str(output_stl))
+        return {"success": True, "path": str(output_stl)}
+
+    return await _run(work)
 
 
 async def fc_export_step(doc_path: Path, output_step: Path) -> dict:
-    """Export all shapes in the document as STEP (true B-rep, not mesh)."""
-    script = f"""
-import FreeCAD, Part, json, os
+    _emit(f"# 导出 STEP (真实 B-rep)\nimport FreeCAD, Part\n"
+          f"doc = FreeCAD.openDocument({str(doc_path)!r})\n"
+          f"# 合并所有 Part::Feature 后 exportStep({str(output_step)!r})")
 
-doc_path = {str(doc_path)!r}
-output_step = {str(output_step)!r}
+    def work() -> dict:
+        doc = _get_doc(str(doc_path))
+        merged = _merged_shapes(doc)
+        if merged is None:
+            return {"success": False, "error": "No shapes in document"}
+        merged.exportStep(str(output_step))
+        return {"success": True, "path": str(output_step)}
 
-try:
-    doc = FreeCAD.openDocument(doc_path)
-    shapes = [o.Shape for o in doc.Objects
-              if o.TypeId == "Part::Feature" and not o.Shape.isNull()]
-    if not shapes:
-        raise RuntimeError("No shapes in document")
-    merged = shapes[0] if len(shapes) == 1 else Part.makeCompound(shapes)
-    merged.exportStep(output_step)
-    print(json.dumps({{"success": True, "path": output_step}}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+    return await _run(work)
 
-
-# ── Legacy helpers ────────────────────────────────────────────────────────────
 
 async def stl_to_step(stl_path: Path, step_path: Path) -> dict:
-    """Convert an STL mesh to STEP (lossy — prefer fc_export_step when possible)."""
-    script = f"""
-import FreeCAD, Mesh, Part, json
+    """Convert an STL mesh to STEP (lossy — prefer fc_export_step)."""
+    def work() -> dict:
+        import Mesh  # type: ignore
+        tmp = FreeCAD.newDocument("export_tmp")
+        try:
+            Mesh.insert(str(stl_path), tmp.Name)
+            mesh_obj = tmp.Objects[0]
+            shape = Part.Shape()
+            shape.makeShapeFromMesh(mesh_obj.Mesh.Topology, 0.05)
+            solid = Part.Solid(shape)
+            solid.exportStep(str(step_path))
+            return {"success": True, "path": str(step_path)}
+        finally:
+            FreeCAD.closeDocument(tmp.Name)
 
-try:
-    doc = FreeCAD.newDocument("export")
-    Mesh.insert({str(stl_path)!r}, doc.Name)
-    mesh_obj = doc.Objects[0]
-    shape = Part.Shape()
-    shape.makeShapeFromMesh(mesh_obj.Mesh.Topology, 0.05)
-    solid = Part.Solid(shape)
-    solid.exportStep({str(step_path)!r})
-    print(json.dumps({{"success": True, "path": {str(step_path)!r}}}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
-
-
-async def create_filleted_box(
-    length: float, width: float, height: float, fillet_radius: float, output_stl: Path
-) -> dict:
-    script = f"""
-import FreeCAD, Part, json
-
-try:
-    shape = Part.makeBox({length}, {width}, {height})
-    shape = shape.makeFillet({fillet_radius}, shape.Edges)
-    shape.exportStl({str(output_stl)!r})
-    print(json.dumps({{"success": True}}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+    return await _run(work)
 
 
-async def create_filleted_cylinder(
-    radius: float, height: float, fillet_radius: float, output_stl: Path
-) -> dict:
-    script = f"""
-import FreeCAD, Part, json
+# ── Reset (drop a project's live doc) ─────────────────────────────────────────
 
-try:
-    shape = Part.makeCylinder({radius}, {height})
-    circ = [e for e in shape.Edges if hasattr(e.Curve, "Radius")]
-    shape = shape.makeFillet({fillet_radius}, circ[:2])
-    shape.exportStl({str(output_stl)!r})
-    print(json.dumps({{"success": True}}))
-except Exception as exc:
-    print(json.dumps({{"success": False, "error": str(exc)}}))
-"""
-    return await run_freecad_script(script)
+async def fc_reset(doc_path: Path) -> dict:
+    """Close + forget the cached document so the project starts fresh."""
+    def work() -> dict:
+        key = str(doc_path)
+        doc = _docs.pop(key, None)
+        if doc is not None:
+            try:
+                FreeCAD.closeDocument(doc.Name)
+            except Exception:
+                pass
+        return {"success": True}
+
+    return await _run(work)
+
+
+# ── Representative scripts for the UI log ─────────────────────────────────────
+
+def _script_create(name, shape_type, length, width, height, radius,
+                   major_radius, minor_radius, fillet_radius, doc_path, stl_path) -> str:
+    maker = {
+        "box": f"Part.makeBox({length}, {width}, {height})",
+        "cylinder": f"Part.makeCylinder({radius}, {height})",
+        "sphere": f"Part.makeSphere({radius})",
+        "cone": f"Part.makeCone(0, {radius}, {height})",
+        "torus": f"Part.makeTorus({major_radius}, {minor_radius})",
+    }.get(shape_type, f"# unknown {shape_type}")
+    lines = [
+        "import FreeCAD, Part",
+        f"doc = FreeCAD.openDocument({str(doc_path)!r}) if os.path.exists({str(doc_path)!r}) else FreeCAD.newDocument('CADScene')",
+        f"shape = {maker}",
+    ]
+    if fillet_radius and fillet_radius > 0 and shape_type in ("box", "cylinder"):
+        lines.append(f"shape = shape.makeFillet({fillet_radius}, shape.Edges)")
+    lines += [
+        f"obj = doc.addObject('Part::Feature', {name!r}); obj.Shape = shape",
+        "doc.recompute(); doc.save()",
+        f"obj.Shape.exportStl({str(stl_path)!r})",
+    ]
+    return "\n".join(lines)
+
+
+def _script_boolean(result_name, fc_op, shape_a, shape_b, doc_path, stl_path) -> str:
+    return "\n".join([
+        "import FreeCAD, Part",
+        f"doc = FreeCAD.openDocument({str(doc_path)!r})",
+        f"a = doc.getObject({shape_a!r}); b = doc.getObject({shape_b!r})",
+        f"res = a.Shape.{fc_op}(b.Shape)",
+        f"obj = doc.addObject('Part::Feature', {result_name!r}); obj.Shape = res",
+        "doc.recompute(); doc.save()",
+        f"obj.Shape.exportStl({str(stl_path)!r})",
+    ])
+
+
+def _script_transform(name, translate, rotate_axis, rotate_angle_deg, scale,
+                      doc_path, stl_path) -> str:
+    lines = [
+        "import FreeCAD, Part",
+        f"doc = FreeCAD.openDocument({str(doc_path)!r})",
+        f"obj = doc.getObject({name!r}); shape = obj.Shape.copy()",
+    ]
+    if translate:
+        lines.append(f"shape.translate(FreeCAD.Vector{tuple(translate)})")
+    if rotate_axis and rotate_angle_deg is not None:
+        lines.append(f"shape.rotate(FreeCAD.Vector(0,0,0), FreeCAD.Vector{tuple(rotate_axis)}, {rotate_angle_deg})")
+    if scale is not None:
+        if isinstance(scale, (int, float)):
+            lines.append(f"shape = shape.scaled({float(scale)})")
+        else:
+            lines.append(f"m = FreeCAD.Matrix(); m.scale(FreeCAD.Vector{tuple(scale)}); shape = shape.transformGeometry(m)")
+    lines += [
+        "obj.Shape = shape; doc.recompute(); doc.save()",
+        f"obj.Shape.exportStl({str(stl_path)!r})",
+    ]
+    return "\n".join(lines)
