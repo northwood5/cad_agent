@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from agent.tools import freecad_bridge
+from agents.cad.tools import freecad_bridge
 
 from agentscope.event import (
     TextBlockDeltaEvent,
@@ -52,7 +52,7 @@ from agentscope.event import (
 )
 from agentscope.message import UserMsg
 
-from agent.cad_agent import build_agent, SUPPORTED_PROVIDERS
+from agents.cad import build_agent, SUPPORTED_PROVIDERS
 
 from db import init_db, repository as repo
 
