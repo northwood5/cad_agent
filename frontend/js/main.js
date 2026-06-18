@@ -201,8 +201,9 @@ function handleEvent(evt) {
 
     case 'model_ready':
       // Load into 3D viewer + update history
-      if (viewer) viewer.loadSTL(evt.url);
+      if (viewer && evt.filename && evt.filename.endsWith('.stl')) viewer.loadSTL(evt.url);
       addToHistory({ filename: evt.filename, url: evt.url, timestamp: evt.timestamp || now() });
+      downloadStepBtn.disabled = false;
       chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
       trace.onEvent(evt);
       break;
