@@ -43,6 +43,11 @@ class CADScene:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.shapes: dict[str, trimesh.Trimesh] = {}
 
+    @property
+    def fc_doc_path(self) -> Path:
+        """Path to the FreeCAD session document (shared across all operations)."""
+        return self.output_dir / "scene.FCStd"
+
     # ------------------------------------------------------------------
     # Primitives
     # ------------------------------------------------------------------
@@ -304,6 +309,21 @@ class CADScene:
             "format": fmt,
             "vertices": len(combined.vertices),
             "faces": len(combined.faces),
+        }
+
+    def load_stl_into_scene(self, name: str, stl_path: Path) -> dict[str, Any]:
+        """Load an STL file produced by FreeCAD back into the trimesh scene."""
+        loaded = trimesh.load(str(stl_path))
+        if isinstance(loaded, trimesh.Scene):
+            mesh = trimesh.util.concatenate(list(loaded.geometry.values()))
+        else:
+            mesh = loaded
+        self.shapes[name] = mesh
+        return {
+            "success": True,
+            "name": name,
+            "vertices": len(mesh.vertices),
+            "faces": len(mesh.faces),
         }
 
     def reset_scene(self) -> dict[str, Any]:
