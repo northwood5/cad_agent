@@ -43,7 +43,7 @@ let   viewer = null;
 
 async function initViewer() {
   try {
-    const { Viewer3D } = await import('./viewer3d.js?v=2');
+    const { Viewer3D } = await import('./viewer3d.js');
     viewer = new Viewer3D(viewerWrap);
     trace.addInfo('3D 渲染器就绪');
   } catch (e) {
@@ -201,7 +201,7 @@ function handleEvent(evt) {
 
     case 'model_ready':
       // Load into 3D viewer + update history
-      if (viewer && evt.filename && evt.filename.endsWith('.stl')) viewer.loadSTL(evt.url);
+      if (viewer) viewer.loadSTL(evt.url);
       addToHistory({ filename: evt.filename, url: evt.url, timestamp: evt.timestamp || now() });
       downloadStepBtn.disabled = false;
       chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
