@@ -115,8 +115,15 @@ class WorkflowService:
                     for s in drain_scripts():
                         yield s
 
-                    payload = event_to_json(evt, call_buf, res_buf,
-                                            node_id=node.id, agent=node.agent)
+                    # Specialists may yield raw platform dicts (stubs) or
+                    # AgentScope events (real agents).
+                    if isinstance(evt, dict):
+                        payload = dict(evt)
+                        payload.setdefault("node_id", node.id)
+                        payload.setdefault("agent", node.agent)
+                    else:
+                        payload = event_to_json(evt, call_buf, res_buf,
+                                                node_id=node.id, agent=node.agent)
                     if not payload:
                         continue
 

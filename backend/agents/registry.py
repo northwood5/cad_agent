@@ -12,17 +12,15 @@ from typing import Any
 
 from .base import SpecialistAgent
 from .cad.agent import CADSpecialist
+from .mesh.agent import MeshSpecialist
+from .cae.agent import CAESpecialist
 
 # name -> SpecialistAgent subclass
 AGENT_REGISTRY: dict[str, type[SpecialistAgent]] = {
     CADSpecialist.name: CADSpecialist,
+    MeshSpecialist.name: MeshSpecialist,   # stub
+    CAESpecialist.name: CAESpecialist,     # stub
 }
-
-# Mesh / CAE specialists are registered here once implemented (see P5):
-#   from .mesh.agent import MeshSpecialist
-#   from .cae.agent import CAESpecialist
-#   AGENT_REGISTRY[MeshSpecialist.name] = MeshSpecialist
-#   AGENT_REGISTRY[CAESpecialist.name] = CAESpecialist
 
 
 def get_specialist_cls(name: str) -> type[SpecialistAgent] | None:
