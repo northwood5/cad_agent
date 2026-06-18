@@ -58,8 +58,16 @@
 采用 **Plan-then-Execute（先规划后执行）** 模式：
 
 1. **Plan 阶段**：OrchestratorAgent 调用 LLM，把用户请求分解为结构化工作流（JSON：节点列表 + 依赖 + 目标 Agent + 子指令）。→ 前端 Tab1 立即渲染整张工作流图。
-2. **Execute 阶段**：WorkflowService 按拓扑顺序逐节点执行，把节点指令交给对应专业 Agent 的 `reply_stream`，实时回传子事件并更新节点状态。
+2. **Execute 阶段**：WorkflowService 按拓扑顺序逐节点执行，把节点指令交给对应专业 Agent 的 `reply_stream`，实时回传子事件并更新节点状态。支持**逐节点中断 / 重置**（默认自动顺序执行）。
 3. **Aggregate 阶段**：汇总结果、落库、通知前端。失败节点可重规划或重试。
+
+### 关于 FreeCAD 运行方式（已从子进程迁移到进程内）
+
+最初通过 `freecad.cmd` 子进程调用 FreeCAD（snap 的 Python 3.12 与 venv 的 3.14 不兼容，无法直接 import）。**现已迁移到 conda-forge 的 FreeCAD**：后端跑在 conda 环境 `cax`（Python 3.11 + freecad），`freecad_bridge` 直接 `import FreeCAD` **进程内调用**，每个项目维护一个常驻内存的 `FreeCAD.Document`（变更后写回 .FCStd 持久化）。
+
+- 收益：去掉每次操作的进程启动与重复磁盘读写开销。
+- 并发：FreeCAD 非线程安全，所有调用经单一专用线程 + `asyncio.Lock` 串行化。
+- 启动：`./start.sh`（使用 `~/miniforge3/envs/cax`）；FreeCAD 不是 pip 依赖，见 `requirements.txt` 顶部说明。
 
 ---
 
