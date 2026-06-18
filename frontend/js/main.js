@@ -8,8 +8,8 @@
 import { ChatPanel }    from './chat.js';
 import { AgentTrace }   from './agent_trace.js';
 import { Tabs }         from './tabs.js';
-import { WorkflowView } from './workflow.js';
-import { ScriptsView }  from './scripts.js?v=5';
+import { WorkflowView } from './workflow.js?v=6';
+import { ScriptsView }  from './scripts.js?v=6';
 import { UserManager }  from './user.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -69,6 +69,15 @@ async function initViewer() {
 
 // When the viewer becomes visible after being hidden, fix its size.
 tabs.onSwitch((name) => { if (name === 'viewer' && viewer) viewer.resetView(); });
+
+// Per-node controls: interrupt the running workflow / rerun from a node.
+workflow.onInterrupt(() => {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: 'interrupt' }));
+});
+workflow.onReset((nodeId) => {
+  if (agentBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'reset_node', node_id: nodeId }));
+});
 
 // ── Model history (per project) ────────────────────────────────────────────────
 let _currentModelUrl = null;
@@ -196,9 +205,13 @@ function handleEvent(evt) {
       chat.finaliseAgentStream();
       break;
 
+    // Final natural-language reply lives ONLY in the chat panel (the trace
+    // panel is reserved for reasoning internals to avoid duplication).
+    case 'text_start':
+    case 'text_end':
+      break;   // chat stream is bracketed by agent_start / agent_done
     case 'text_delta':
       chat.appendAgentText(evt.text);
-      trace.onEvent(evt);
       break;
 
     // ── Workflow (Tab 1) ──
@@ -208,12 +221,17 @@ function handleEvent(evt) {
       break;
     case 'workflow_node_start':
       workflow.setNodeStatus(evt.node_id, 'running');
+      // Section header in the trace so tool events can be attributed to a node.
+      trace.addInfo(`▶ ${(evt.agent || '').toUpperCase()}：${evt.title || evt.node_id}`);
       break;
     case 'workflow_node_done':
       workflow.setNodeDone(evt.node_id, evt.status, evt.summary, evt.artifacts);
       break;
+    case 'workflow_node_reset':
+      workflow.setNodeStatus(evt.node_id, 'pending');
+      break;
     case 'workflow_done':
-      trace.addInfo(`工作流完成：${evt.status}`);
+      trace.addInfo(`工作流结束：${evt.status}`);
       break;
 
     // ── Script log (Tab 3) ──
@@ -222,13 +240,12 @@ function handleEvent(evt) {
       tabs.notify('scripts');
       break;
 
-    // ── Model (Tab 2) ──
+    // ── Model (Tab 2) — notice in chat only, not echoed to trace ──
     case 'model_ready':
       if (viewer && evt.filename && evt.filename.endsWith('.stl')) viewer.loadSTL(evt.url);
       addToHistory({ filename: evt.filename, url: evt.url, timestamp: now() });
       tabs.notify('viewer');
       chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
-      trace.onEvent(evt);
       break;
 
     case 'error':
@@ -236,7 +253,6 @@ function handleEvent(evt) {
       setSendEnabled(true);
       chat.finaliseAgentStream();
       chat.addSystem(`错误: ${evt.message}`);
-      trace.onEvent(evt);
       break;
 
     case 'session_ready':

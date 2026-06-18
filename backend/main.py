@@ -34,7 +34,7 @@ from agents.cad import SUPPORTED_PROVIDERS
 
 from db import init_db, repository as repo
 from services.session_service import SessionManager, ProjectSession
-from services.workflow_service import WorkflowService
+from services.workflow_service import WorkflowService, WorkflowController
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).parent.parent
@@ -114,6 +114,40 @@ init_db()
 async def ws_chat(websocket: WebSocket, project_id: int):
     await websocket.accept()
     logger.info("WS connected: project=%s", project_id)
+
+    send_lock = asyncio.Lock()
+
+    async def send(payload: dict) -> None:
+        async with send_lock:
+            await websocket.send_json(payload)
+
+    # One persistent WorkflowService per connection so reset/rerun can target
+    # the last plan; the current run task + controller live alongside it.
+    state: dict[str, Any] = {"service": None, "task": None, "controller": None}
+
+    def busy() -> bool:
+        t = state["task"]
+        return t is not None and not t.done()
+
+    async def run_stream(gen) -> None:
+        """Drive a workflow generator, stream events, persist the reply."""
+        await send({"type": "agent_start"})
+        reply_buf: list[str] = []
+        try:
+            async for payload in gen:
+                if payload.get("type") == "text_delta":
+                    reply_buf.append(payload.get("text", ""))
+                await send(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Workflow error  project=%s", project_id)
+            await send({"type": "error", "message": str(exc)})
+        reply_text = "".join(reply_buf).strip()
+        if reply_text:
+            repo.add_message(project_id, "agent", reply_text)
+        await send({"type": "agent_done"})
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -124,16 +158,40 @@ async def ws_chat(websocket: WebSocket, project_id: int):
 
             action = data.get("action", "chat")
 
+            # ── interrupt the running workflow ──
+            if action == "interrupt":
+                if state["controller"] is not None:
+                    state["controller"].interrupt()
+                continue
+
+            # ── reset / rerun from a node ──
+            if action == "reset_node":
+                if busy() or state["service"] is None:
+                    continue
+                node_id = data.get("node_id")
+                if not node_id:
+                    continue
+                ctrl = WorkflowController()
+                state["controller"] = ctrl
+                gen = state["service"].rerun_from(node_id, ctrl)
+                state["task"] = asyncio.create_task(run_stream(gen))
+                continue
+
             # ── reset project session (clears in-memory geometry state) ──
             if action == "new_session":
+                if busy() and state["controller"] is not None:
+                    state["controller"].interrupt()
                 session_manager.drop(project_id)
                 _get_session(project_id)
-                await websocket.send_json(
-                    {"type": "session_ready", "session_id": project_id})
+                state["service"] = None
+                await send({"type": "session_ready", "session_id": project_id})
                 continue
 
             if action != "chat":
                 continue
+
+            if busy():
+                continue  # ignore new requests while a workflow runs
 
             user_text: str = data.get("text", "").strip()
             if not user_text:
@@ -152,32 +210,19 @@ async def ws_chat(websocket: WebSocket, project_id: int):
                          for s in shapes["shapes"]],
                         ensure_ascii=False)
 
-            # Persist the user's message.
             repo.add_message(project_id, "user", user_text)
 
-            await websocket.send_json({"type": "agent_start"})
-
-            agent_reply_buf: list[str] = []
-            try:
-                workflow = WorkflowService(session, _active_llm_cfg())
-                async for payload in workflow.execute(user_text, scene_state):
-                    if payload.get("type") == "text_delta":
-                        agent_reply_buf.append(payload.get("text", ""))
-                    await websocket.send_json(payload)
-            except Exception as exc:
-                logger.exception("Workflow error  project=%s", project_id)
-                await websocket.send_json(
-                    {"type": "error", "message": str(exc)})
-
-            # Persist the agent's aggregated reply text.
-            reply_text = "".join(agent_reply_buf).strip()
-            if reply_text:
-                repo.add_message(project_id, "agent", reply_text)
-
-            await websocket.send_json({"type": "agent_done"})
+            state["service"] = WorkflowService(session, _active_llm_cfg())
+            ctrl = WorkflowController()
+            state["controller"] = ctrl
+            gen = state["service"].execute(user_text, scene_state, ctrl)
+            state["task"] = asyncio.create_task(run_stream(gen))
 
     except WebSocketDisconnect:
         logger.info("WS disconnected: project=%s", project_id)
+        t = state["task"]
+        if t is not None and not t.done():
+            t.cancel()
 
 
 # ── REST: LLM config ────────────────────────────────────────────────────────

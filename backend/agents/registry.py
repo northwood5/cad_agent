@@ -14,12 +14,14 @@ from .base import SpecialistAgent
 from .cad.agent import CADSpecialist
 from .mesh.agent import MeshSpecialist
 from .cae.agent import CAESpecialist
+from .post.agent import PostSpecialist
 
 # name -> SpecialistAgent subclass
 AGENT_REGISTRY: dict[str, type[SpecialistAgent]] = {
     CADSpecialist.name: CADSpecialist,
     MeshSpecialist.name: MeshSpecialist,   # stub
     CAESpecialist.name: CAESpecialist,     # stub
+    PostSpecialist.name: PostSpecialist,   # stub
 }
 
 

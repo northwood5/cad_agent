@@ -497,6 +497,25 @@ header h1 span { color: var(--accent); }
 .badge-cae  { background: #3a2a1a; color: var(--orange); }
 .wf-title { font-size: 13.5px; font-weight: 600; color: var(--text); flex: 1; }
 .wf-status-icon { font-size: 13px; flex-shrink: 0; }
+
+/* Per-node controls (interrupt / reset) */
+.wf-controls { display: flex; gap: 4px; flex-shrink: 0; }
+.wf-btn {
+  font-size: 11px; padding: 2px 8px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--bg-input);
+  color: var(--text-muted); cursor: pointer; white-space: nowrap;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.wf-btn:hover { color: var(--text); border-color: var(--accent); }
+.wf-btn.js-interrupt:hover { color: var(--orange); border-color: var(--orange); }
+.wf-btn.js-reset:hover { color: var(--accent); border-color: var(--accent); }
+/* Show 中断 only while running; show 重置 only once finished. */
+.wf-controls .js-interrupt,
+.wf-controls .js-reset { display: none; }
+.wf-node.running  .js-interrupt { display: inline-block; }
+.wf-node.success  .js-reset,
+.wf-node.failed   .js-reset,
+.wf-node.interrupted .js-reset { display: inline-block; }
 .wf-instruction {
   font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.5;
   white-space: pre-wrap; word-break: break-word;
