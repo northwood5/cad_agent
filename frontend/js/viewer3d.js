@@ -32,16 +32,19 @@ export class Viewer3D {
     const grid = new THREE.GridHelper(200, 20, 0x1e2236, 0x1e2236);
     this._scene.add(grid);
 
-    // Lights
-    this._scene.add(new THREE.AmbientLight(0xffffff, 0.4));
-    const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
+    // Lights — tuned for silver metallic material
+    this._scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+    const dir1 = new THREE.DirectionalLight(0xffffff, 1.1);
     dir1.position.set(100, 150, 100);
     dir1.castShadow = true;
     this._scene.add(dir1);
-    const dir2 = new THREE.DirectionalLight(0x8ab4f8, 0.4);
+    const dir2 = new THREE.DirectionalLight(0xd0e8ff, 0.6);
     dir2.position.set(-80, 60, -80);
     this._scene.add(dir2);
-    const fill = new THREE.DirectionalLight(0xffffff, 0.2);
+    const dir3 = new THREE.DirectionalLight(0xfff0e0, 0.4);
+    dir3.position.set(50, -60, 80);
+    this._scene.add(dir3);
+    const fill = new THREE.DirectionalLight(0xffffff, 0.25);
     fill.position.set(0, -100, 0);
     this._scene.add(fill);
 
@@ -90,10 +93,12 @@ export class Viewer3D {
           this._mesh = null;
         }
         geometry.computeVertexNormals();
+        // Silver metallic: high shininess + near-white specular
         const mat = new THREE.MeshPhongMaterial({
-          color: 0x4f8ef7,
-          specular: 0x334466,
-          shininess: 60,
+          color:    0xc8ccd4,   // silver-white base
+          specular: 0xffffff,   // pure white highlight
+          shininess: 320,
+          emissive:  0x0a0c10,  // faint dark self-glow for depth
           side: THREE.DoubleSide,
         });
         this._mesh = new THREE.Mesh(geometry, mat);

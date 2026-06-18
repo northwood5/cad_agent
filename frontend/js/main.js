@@ -43,7 +43,7 @@ let   viewer = null;
 
 async function initViewer() {
   try {
-    const { Viewer3D } = await import('./viewer3d.js');
+    const { Viewer3D } = await import('./viewer3d.js?v=2');
     viewer = new Viewer3D(viewerWrap);
     trace.addInfo('3D 渲染器就绪');
   } catch (e) {
