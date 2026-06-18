@@ -9,7 +9,7 @@ import { ChatPanel }    from './chat.js';
 import { AgentTrace }   from './agent_trace.js';
 import { Tabs }         from './tabs.js';
 import { WorkflowView } from './workflow.js';
-import { ScriptsView }  from './scripts.js';
+import { ScriptsView }  from './scripts.js?v=5';
 import { UserManager }  from './user.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
