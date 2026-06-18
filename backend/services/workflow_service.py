@@ -21,6 +21,7 @@ from typing import Any, AsyncIterator
 
 from agents.base import TaskContext
 from agents.orchestrator import OrchestratorAgent
+from agents.cad.tools import freecad_bridge
 from db import repository as repo
 from .event_serializer import event_to_json
 from .session_service import ProjectSession
@@ -91,8 +92,29 @@ class WorkflowService:
             artifacts: list[dict[str, Any]] = []
             node_ok = True
 
+            # Capture FreeCAD scripts generated during this node for Tab 3.
+            pending_scripts: list[str] = []
+            sink_token = freecad_bridge.set_script_sink(pending_scripts.append)
+
+            def drain_scripts():
+                events = []
+                while pending_scripts:
+                    content = pending_scripts.pop(0)
+                    row = repo.add_script(project_id, node.agent, "freecad",
+                                          "python", content,
+                                          run_id=run_id, node_id=db_id)
+                    events.append({"type": "script_generated",
+                                   "node_id": node.id, "agent": node.agent,
+                                   "software": "freecad", "language": "python",
+                                   "filename": f"freecad_{row['id']}.py",
+                                   "content": content})
+                return events
+
             try:
                 async for evt in specialist.run(node.instruction, context):
+                    for s in drain_scripts():
+                        yield s
+
                     payload = event_to_json(evt, call_buf, res_buf,
                                             node_id=node.id, agent=node.agent)
                     if not payload:
@@ -120,11 +142,16 @@ class WorkflowService:
                                "url": self._model_url(art["filename"]),
                                "node_id": node.id, "agent": node.agent}
 
+                for s in drain_scripts():
+                    yield s
+
             except Exception as exc:
                 node_ok = False
                 logger.exception("Node %s (%s) failed", node.id, node.agent)
                 yield {"type": "error", "message": str(exc),
                        "node_id": node.id, "agent": node.agent}
+            finally:
+                freecad_bridge.reset_script_sink(sink_token)
 
             status = "success" if node_ok else "failed"
             summary = final_text.strip()[:500]

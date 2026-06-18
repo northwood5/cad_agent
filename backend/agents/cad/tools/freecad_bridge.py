@@ -11,6 +11,7 @@ per session. FreeCAD B-rep geometry is the source of truth; STL is
 exported for the 3-D viewer after every mutating call.
 """
 import asyncio
+import contextvars
 import json
 import logging
 import tempfile
@@ -21,6 +22,23 @@ logger = logging.getLogger(__name__)
 FREECAD_CMD = "freecad.cmd"
 TIMEOUT = 60  # seconds per operation
 
+# ── Script capture sink ───────────────────────────────────────────────────────
+# When set (by the workflow service for the duration of a node), every FreeCAD
+# script we are about to execute is reported to this callback so it can be shown
+# in the frontend's script-log tab and persisted.
+_script_sink: contextvars.ContextVar = contextvars.ContextVar(
+    "freecad_script_sink", default=None
+)
+
+
+def set_script_sink(fn):
+    """Register a callback ``fn(script: str)`` for captured FreeCAD scripts."""
+    return _script_sink.set(fn)
+
+
+def reset_script_sink(token) -> None:
+    _script_sink.reset(token)
+
 
 # ── Low-level runner ─────────────────────────────────────────────────────────
 
@@ -30,6 +48,13 @@ async def run_freecad_script(script: str) -> dict:
     The freecad snap cannot access /tmp, so the script is placed in $HOME.
     The last JSON line in stdout is parsed and returned as a dict.
     """
+    sink = _script_sink.get()
+    if sink is not None:
+        try:
+            sink(script)
+        except Exception:  # capturing must never break execution
+            logger.debug("script sink raised", exc_info=True)
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, prefix="fc_",
         dir=Path.home(),
