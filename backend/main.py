@@ -30,31 +30,11 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from agents.cad.tools import freecad_bridge
-
-from agentscope.event import (
-    TextBlockDeltaEvent,
-    TextBlockStartEvent,
-    TextBlockEndEvent,
-    ThinkingBlockStartEvent,
-    ThinkingBlockDeltaEvent,
-    ThinkingBlockEndEvent,
-    ToolCallStartEvent,
-    ToolCallDeltaEvent,
-    ToolCallEndEvent,
-    ToolResultStartEvent,
-    ToolResultTextDeltaEvent,
-    ToolResultEndEvent,
-    ReplyStartEvent,
-    ReplyEndEvent,
-    ModelCallStartEvent,
-    ModelCallEndEvent,
-    ExceedMaxItersEvent,
-)
-from agentscope.message import UserMsg
-
-from agents.cad import build_agent, SUPPORTED_PROVIDERS
+from agents.cad import SUPPORTED_PROVIDERS
 
 from db import init_db, repository as repo
+from services.session_service import SessionManager, ProjectSession
+from services.workflow_service import WorkflowService
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).parent.parent
@@ -103,90 +83,20 @@ def _active_llm_cfg() -> dict[str, Any]:
     return dict(_config["providers"][provider])
 
 
-# ── Session registry ────────────────────────────────────────────────────────
-#   session_id → { agent, scene, model_history: [{filename, url, ts}] }
-_sessions: dict[str, Any] = {}
+# ── Session registry (per project) ──────────────────────────────────────────
+session_manager = SessionManager()
 
 
-def _get_or_create(sid: str) -> dict[str, Any]:
-    if sid not in _sessions:
-        out = OUTPUT_DIR / sid
-        out.mkdir(parents=True, exist_ok=True)
-        agent, scene = build_agent(_active_llm_cfg(), out)
-        _sessions[sid] = {"agent": agent, "scene": scene, "model_history": []}
-        logger.info("New session %s  provider=%s", sid, _config.get("active_provider"))
-    return _sessions[sid]
+def _project_workspace(project_id: int) -> Path:
+    out = OUTPUT_DIR / str(project_id)
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
 
-# ── Event serialiser (AgentScope 2.x) ──────────────────────────────────────
-
-def _to_json(
-    evt: Any,
-    call_buf: dict[str, str],
-    res_buf:  dict[str, str],
-) -> dict[str, Any] | None:
-    """
-    AgentScope 2.x correct field names:
-      ToolCallStartEvent  → tool_call_id, tool_call_name
-      ToolCallDeltaEvent  → tool_call_id, delta
-      ToolCallEndEvent    → tool_call_id   (NO arguments field)
-      ToolResultStart     → tool_call_id, tool_call_name
-      ToolResultTextDelta → tool_call_id, delta
-      ToolResultEndEvent  → tool_call_id, state
-    """
-    if isinstance(evt, (ReplyStartEvent, ReplyEndEvent,
-                        ModelCallStartEvent, ModelCallEndEvent)):
-        return None
-
-    if isinstance(evt, ThinkingBlockStartEvent):
-        return {"type": "thinking_start"}
-    if isinstance(evt, ThinkingBlockDeltaEvent):
-        return {"type": "thinking_delta", "text": evt.delta}
-    if isinstance(evt, ThinkingBlockEndEvent):
-        return {"type": "thinking_end"}
-
-    if isinstance(evt, TextBlockStartEvent):
-        return {"type": "text_start"}
-    if isinstance(evt, TextBlockDeltaEvent):
-        return {"type": "text_delta", "text": evt.delta}
-    if isinstance(evt, TextBlockEndEvent):
-        return {"type": "text_end"}
-
-    if isinstance(evt, ToolCallStartEvent):
-        call_buf[evt.tool_call_id] = ""
-        return {"type": "tool_call_start",
-                "tool": evt.tool_call_name, "id": evt.tool_call_id}
-
-    if isinstance(evt, ToolCallDeltaEvent):
-        call_buf[evt.tool_call_id] = call_buf.get(evt.tool_call_id, "") + evt.delta
-        return {"type": "tool_call_delta",
-                "delta": evt.delta, "id": evt.tool_call_id}
-
-    if isinstance(evt, ToolCallEndEvent):
-        args = call_buf.pop(evt.tool_call_id, "{}")
-        return {"type": "tool_call_end", "args": args, "id": evt.tool_call_id}
-
-    if isinstance(evt, ToolResultStartEvent):
-        res_buf[evt.tool_call_id] = ""
-        return {"type": "tool_result_start",
-                "tool": evt.tool_call_name, "id": evt.tool_call_id}
-
-    if isinstance(evt, ToolResultTextDeltaEvent):
-        res_buf[evt.tool_call_id] = res_buf.get(evt.tool_call_id, "") + evt.delta
-        return {"type": "tool_result_delta",
-                "text": evt.delta, "id": evt.tool_call_id}
-
-    if isinstance(evt, ToolResultEndEvent):
-        result_text = res_buf.pop(evt.tool_call_id, "")
-        return {"type": "tool_result_end",
-                "id": evt.tool_call_id,
-                "state": str(evt.state),
-                "result": result_text}
-
-    if isinstance(evt, ExceedMaxItersEvent):
-        return {"type": "error", "message": "Agent 超过最大迭代次数，请简化请求"}
-
-    return None
+def _get_session(project_id: int) -> ProjectSession:
+    return session_manager.get_or_create(
+        project_id, _active_llm_cfg(), _project_workspace(project_id)
+    )
 
 
 # ── FastAPI app ─────────────────────────────────────────────────────────────
@@ -200,10 +110,10 @@ init_db()
 
 # ── WebSocket ───────────────────────────────────────────────────────────────
 
-@app.websocket("/ws/chat/{session_id}")
-async def ws_chat(websocket: WebSocket, session_id: str):
+@app.websocket("/ws/chat/{project_id}")
+async def ws_chat(websocket: WebSocket, project_id: int):
     await websocket.accept()
-    logger.info("WS connected: %s", session_id)
+    logger.info("WS connected: project=%s", project_id)
     try:
         while True:
             raw = await websocket.receive_text()
@@ -214,12 +124,12 @@ async def ws_chat(websocket: WebSocket, session_id: str):
 
             action = data.get("action", "chat")
 
-            # ── new session / reset ──
+            # ── reset project session (clears in-memory geometry state) ──
             if action == "new_session":
-                _sessions.pop(session_id, None)
-                _get_or_create(session_id)
+                session_manager.drop(project_id)
+                _get_session(project_id)
                 await websocket.send_json(
-                    {"type": "session_ready", "session_id": session_id})
+                    {"type": "session_ready", "session_id": project_id})
                 continue
 
             if action != "chat":
@@ -229,67 +139,45 @@ async def ws_chat(websocket: WebSocket, session_id: str):
             if not user_text:
                 continue
 
-            sess  = _get_or_create(session_id)
-            agent = sess["agent"]
-            scene = sess["scene"]
+            session = _get_session(project_id)
 
-            # ── P7: inject current scene state so agent is aware ──
-            scene_state = scene.list_shapes()
-            if scene_state["count"] > 0:
-                shapes_brief = json.dumps(
-                    [{"name": s["name"], "bounds": s["bounds"]}
-                     for s in scene_state["shapes"]],
-                    ensure_ascii=False)
-                ctx_text = (
-                    f"[场景上下文 — 当前已有 {scene_state['count']} 个形状: "
-                    f"{shapes_brief}]\n\n{user_text}"
-                )
-            else:
-                ctx_text = user_text
+            # ── inject current scene state so agents stay context-aware ──
+            scene_state = ""
+            scene = session.cad_scene
+            if scene is not None:
+                shapes = scene.list_shapes()
+                if shapes["count"] > 0:
+                    scene_state = json.dumps(
+                        [{"name": s["name"], "bounds": s["bounds"]}
+                         for s in shapes["shapes"]],
+                        ensure_ascii=False)
+
+            # Persist the user's message.
+            repo.add_message(project_id, "user", user_text)
 
             await websocket.send_json({"type": "agent_start"})
 
-            call_buf: dict[str, str] = {}
-            res_buf:  dict[str, str] = {}
-            new_exports: list[str]   = []
-
+            agent_reply_buf: list[str] = []
             try:
-                async for evt in agent.reply_stream(UserMsg(name="user", content=ctx_text)):
-                    payload = _to_json(evt, call_buf, res_buf)
-                    if payload:
-                        await websocket.send_json(payload)
-
-                    # Detect export_model results
-                    if isinstance(evt, ToolResultEndEvent):
-                        result_text = res_buf.get(evt.tool_call_id, "")
-                        # res_buf already popped; use payload
-                        result_text = (payload or {}).get("result", "")
-                        try:
-                            parsed = json.loads(result_text)
-                            if parsed.get("success") and "filename" in parsed:
-                                new_exports.append(parsed["filename"])
-                        except Exception:
-                            pass
-
+                workflow = WorkflowService(session, _active_llm_cfg())
+                async for payload in workflow.execute(user_text, scene_state):
+                    if payload.get("type") == "text_delta":
+                        agent_reply_buf.append(payload.get("text", ""))
+                    await websocket.send_json(payload)
             except Exception as exc:
-                logger.exception("Agent error  session=%s", session_id)
+                logger.exception("Workflow error  project=%s", project_id)
                 await websocket.send_json(
                     {"type": "error", "message": str(exc)})
 
-            # Notify frontend of each new model file
-            for fname in new_exports:
-                entry = {
-                    "filename": fname,
-                    "url":  f"/api/models/{session_id}/{fname}",
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                }
-                sess["model_history"].append(entry)
-                await websocket.send_json({"type": "model_ready", **entry})
+            # Persist the agent's aggregated reply text.
+            reply_text = "".join(agent_reply_buf).strip()
+            if reply_text:
+                repo.add_message(project_id, "agent", reply_text)
 
             await websocket.send_json({"type": "agent_done"})
 
     except WebSocketDisconnect:
-        logger.info("WS disconnected: %s", session_id)
+        logger.info("WS disconnected: project=%s", project_id)
 
 
 # ── REST: LLM config ────────────────────────────────────────────────────────
@@ -335,7 +223,7 @@ async def update_config(body: dict):
     except Exception as e:
         logger.warning("Config save failed: %s", e)
 
-    _sessions.clear()   # recreate sessions with new model on next request
+    session_manager.clear()   # recreate sessions with new model on next request
     return JSONResponse({
         "status": "ok",
         "active_provider": _config["active_provider"],
@@ -343,29 +231,22 @@ async def update_config(body: dict):
     })
 
 
-# ── REST: session data ──────────────────────────────────────────────────────
+# ── REST: scene data ────────────────────────────────────────────────────────
 
-@app.get("/api/sessions/{session_id}/history")
-async def get_model_history(session_id: str):
-    sess = _sessions.get(session_id)
-    if not sess:
-        return JSONResponse({"history": []})
-    return JSONResponse({"history": sess["model_history"]})
-
-
-@app.get("/api/sessions/{session_id}/shapes")
-async def get_scene_shapes(session_id: str):
-    sess = _sessions.get(session_id)
-    if not sess:
+@app.get("/api/sessions/{project_id}/shapes")
+async def get_scene_shapes(project_id: int):
+    session = session_manager.get(project_id)
+    scene = session.cad_scene if session else None
+    if scene is None:
         return JSONResponse({"shapes": [], "count": 0})
-    return JSONResponse(sess["scene"].list_shapes())
+    return JSONResponse(scene.list_shapes())
 
 
 # ── REST: model file download ───────────────────────────────────────────────
 
-@app.get("/api/models/{session_id}/{filename}")
-async def serve_model(session_id: str, filename: str):
-    filepath = OUTPUT_DIR / session_id / filename
+@app.get("/api/models/{project_id}/{filename}")
+async def serve_model(project_id: int, filename: str):
+    filepath = OUTPUT_DIR / str(project_id) / filename
     if not filepath.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
     _media_map = {".stl": "model/stl", ".obj": "model/obj", ".step": "application/step", ".stp": "application/step"}
@@ -379,18 +260,15 @@ async def serve_model(session_id: str, filename: str):
 
 # ── REST: on-demand STEP export ─────────────────────────────────────────────
 
-@app.get("/api/sessions/{session_id}/export/step")
-async def export_step(session_id: str):
-    """Export the current session's FreeCAD document as a STEP file on demand."""
-    sess = _sessions.get(session_id)
-    if not sess:
-        return JSONResponse({"error": "session not found"}, status_code=404)
-
-    scene = sess["scene"]
-    if not scene.shapes:
+@app.get("/api/sessions/{project_id}/export/step")
+async def export_step(project_id: int):
+    """Export the current project's FreeCAD document as a STEP file on demand."""
+    session = session_manager.get(project_id)
+    scene = session.cad_scene if session else None
+    if scene is None or not scene.shapes:
         return JSONResponse({"error": "scene is empty"}, status_code=400)
 
-    out_dir = OUTPUT_DIR / session_id
+    out_dir = _project_workspace(project_id)
     step_path = out_dir / f"export_{uuid.uuid4().hex[:8]}.step"
 
     if scene.fc_doc_path.exists():
@@ -408,12 +286,7 @@ async def export_step(session_id: str):
     if not result.get("success"):
         return JSONResponse({"error": result.get("error", "Export failed")}, status_code=500)
 
-    entry = {
-        "filename": step_path.name,
-        "url": f"/api/models/{session_id}/{step_path.name}",
-        "timestamp": datetime.now().strftime("%H:%M:%S"),
-    }
-    sess["model_history"].append(entry)
+    repo.add_artifact(project_id, "step", step_path.name, str(step_path))
     return FileResponse(
         str(step_path),
         media_type="application/step",

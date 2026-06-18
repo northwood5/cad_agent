@@ -3,15 +3,25 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CAD Agent</title>
+<title>CAx Agent</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/css/style.css" />
+<link rel="stylesheet" href="/css/style.css?v=4" />
 </head>
 <body>
 
 <!-- ═══════════════════ Header ═══════════════════ -->
 <header>
-  <h1><span>CAD</span> Agent</h1>
+  <h1><span>CAx</span> Agent</h1>
+
+  <!-- User + project selector -->
+  <div class="user-area">
+    <button class="user-chip" id="user-chip" title="切换用户">
+      <span class="user-icon">👤</span>
+      <span id="user-name">未登录</span>
+    </button>
+    <select id="project-select" class="project-select" title="切换项目"></select>
+    <button class="btn-sm" id="btn-new-project" title="新建项目">＋ 项目</button>
+  </div>
 
   <!-- Active LLM badge (populated by JS) -->
   <div id="llm-badge" class="llm-badge" title="当前使用的 LLM">
@@ -21,7 +31,7 @@
 
   <div class="header-btns">
     <button class="btn" id="btn-reset-view" title="重置 3D 视角">重置视角</button>
-    <button class="btn btn-danger" id="btn-new-session" title="清空场景并开始新会话">新会话</button>
+    <button class="btn btn-danger" id="btn-new-session" title="清空当前项目场景">清空场景</button>
     <button class="btn btn-primary" id="btn-settings">LLM 设置</button>
   </div>
 </header>
@@ -30,35 +40,73 @@
 <div class="main">
   <div class="work-area">
 
-    <!-- ── 3D Viewer ── -->
+    <!-- ── Graphics work area (3 tabs) ── -->
     <div id="viewer-panel">
-      <div id="viewer-toolbar">
-        <span class="toolbar-hint">拖拽旋转 · 滚轮缩放 · 右键平移</span>
-        <div class="toolbar-actions">
-          <button class="btn-sm" id="btn-download-stl" disabled title="下载当前模型 STL">⬇ STL</button>
-          <button class="btn-sm" id="btn-download-step" disabled title="导出 STEP 文件（可用于 SolidWorks / Fusion 360 等 CAD 软件）">⬇ STEP</button>
-          <button class="btn-sm" id="btn-history-toggle" title="模型版本历史">历史</button>
-        </div>
+
+      <!-- Tab bar -->
+      <div id="tab-bar">
+        <button class="tab-btn active" data-tab="workflow">🧩 编排工作流</button>
+        <button class="tab-btn" data-tab="viewer">🧊 3D 视图</button>
+        <button class="tab-btn" data-tab="scripts">📜 脚本日志</button>
       </div>
-      <div id="viewer-canvas-wrap">
-        <div id="viewer-placeholder">
-          <div class="icon">⬡</div>
-          <div>向 Agent 描述你想创建的 CAD 模型</div>
-          <div style="font-size:11px;opacity:.6">模型生成后将在此处显示</div>
+
+      <!-- Tab 1: Workflow orchestration -->
+      <div class="tab-pane active" id="tab-workflow">
+        <div id="workflow-canvas">
+          <div id="workflow-placeholder">
+            <div class="icon">🧩</div>
+            <div>描述你的 CAx 任务，Agent 将自动编排工作流</div>
+            <div style="font-size:11px;opacity:.6">CAD 建模 · 网格剖分 · 仿真分析</div>
+          </div>
+          <div id="workflow-list"></div>
         </div>
       </div>
 
-      <!-- Model version history sidebar -->
-      <div id="history-panel" class="history-panel hidden">
-        <div class="history-header">
-          <span>模型历史</span>
-          <span id="history-close" class="history-close">×</span>
+      <!-- Tab 2: 3D viewer -->
+      <div class="tab-pane" id="tab-viewer">
+        <div id="viewer-toolbar">
+          <span class="toolbar-hint">拖拽旋转 · 滚轮缩放 · 右键平移</span>
+          <div class="toolbar-actions">
+            <button class="btn-sm" id="btn-download-stl" disabled title="下载当前模型 STL">⬇ STL</button>
+            <button class="btn-sm" id="btn-download-step" disabled title="导出 STEP 文件（可用于 SolidWorks / Fusion 360 等 CAD 软件）">⬇ STEP</button>
+            <button class="btn-sm" id="btn-history-toggle" title="模型版本历史">历史</button>
+          </div>
         </div>
-        <div id="history-list" class="history-list">
-          <div class="history-empty">暂无历史记录</div>
+        <div id="viewer-canvas-wrap">
+          <div id="viewer-placeholder">
+            <div class="icon">⬡</div>
+            <div>向 Agent 描述你想创建的 CAD 模型</div>
+            <div style="font-size:11px;opacity:.6">模型生成后将在此处显示</div>
+          </div>
+
+          <!-- Model version history sidebar -->
+          <div id="history-panel" class="history-panel hidden">
+            <div class="history-header">
+              <span>模型历史</span>
+              <span id="history-close" class="history-close">×</span>
+            </div>
+            <div id="history-list" class="history-list">
+              <div class="history-empty">暂无历史记录</div>
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+
+      <!-- Tab 3: Script log -->
+      <div class="tab-pane" id="tab-scripts">
+        <div id="scripts-toolbar">
+          <span class="toolbar-hint">LLM 生成、发送给 CAx 软件的脚本</span>
+        </div>
+        <div id="scripts-list">
+          <div id="scripts-placeholder">
+            <div class="icon">📜</div>
+            <div>暂无脚本</div>
+            <div style="font-size:11px;opacity:.6">Agent 调用 FreeCAD / Gmsh 等软件时，脚本将记录在此</div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- #viewer-panel -->
 
     <!-- ── Chat panel ── -->
     <div id="chat-panel">
@@ -66,7 +114,7 @@
       <div id="chat-input-bar">
         <textarea
           id="chat-input"
-          placeholder="描述你想要的 CAD 模型… (Enter 发送，Shift+Enter 换行)"
+          placeholder="描述你想要的 CAx 任务… (Enter 发送，Shift+Enter 换行)"
           rows="1"
         ></textarea>
         <button id="send-btn" title="发送 (Enter)">
@@ -135,6 +183,6 @@
   </div>
 </div>
 
-<script type="module" src="/js/main.js?v=3"></script>
+<script type="module" src="/js/main.js?v=4"></script>
 </body>
 </html>
