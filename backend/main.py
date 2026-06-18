@@ -361,7 +361,8 @@ async def serve_model(session_id: str, filename: str):
     filepath = OUTPUT_DIR / session_id / filename
     if not filepath.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
-    media = "model/stl" if filename.endswith(".stl") else "application/octet-stream"
+    _media_map = {".stl": "model/stl", ".obj": "model/obj", ".step": "application/step", ".stp": "application/step"}
+    media = _media_map.get(Path(filename).suffix.lower(), "application/octet-stream")
     return FileResponse(
         str(filepath),
         media_type=media,

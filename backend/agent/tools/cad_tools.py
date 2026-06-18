@@ -5,6 +5,8 @@ Each tool is auto-allowed (local ops, no user confirmation needed).
 """
 import json
 import asyncio
+import uuid
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 from agentscope.tool import ToolBase
@@ -17,6 +19,7 @@ from agentscope.permission import (
 from agentscope.message import TextBlock, ToolResultState
 
 from .cad_engine import CADScene
+from . import freecad_bridge
 
 
 def _ok_chunk(data: dict) -> ToolChunk:
@@ -70,6 +73,14 @@ class CreatePrimitive(ToolBase):
                 "description": "Resolution for curved shapes (default 64)",
                 "default": 64,
             },
+            "fillet_radius": {
+                "type": "number",
+                "description": (
+                    "Round the edges with this radius in mm (box and cylinder only). "
+                    "Uses FreeCAD for precise B-rep filleting. 0 = no fillet (default)."
+                ),
+                "default": 0,
+            },
         },
         "required": ["name", "shape_type"],
     }
@@ -95,9 +106,35 @@ class CreatePrimitive(ToolBase):
         major_radius: float = 10.0,
         minor_radius: float = 3.0,
         segments: int = 64,
+        fillet_radius: float = 0.0,
         **_: Any,
     ) -> ToolChunk:
         result: dict
+
+        # ── FreeCAD path: fillet requested for box or cylinder ──────────────
+        if fillet_radius > 0 and shape_type in ("box", "cylinder"):
+            # FreeCAD snap can only write to home directory, not /tmp
+            tmp_stl = Path.home() / f"_fc_{uuid.uuid4().hex[:8]}.stl"
+            if shape_type == "box":
+                fc_result = await freecad_bridge.create_filleted_box(
+                    length, width, height, fillet_radius, tmp_stl
+                )
+            else:
+                fc_result = await freecad_bridge.create_filleted_cylinder(
+                    radius, height, fillet_radius, tmp_stl
+                )
+            if fc_result.get("success"):
+                result = await asyncio.to_thread(
+                    self._scene.load_stl_into_scene, name, tmp_stl
+                )
+                if result.get("success"):
+                    result.update({"type": shape_type, "fillet_radius": fillet_radius})
+                tmp_stl.unlink(missing_ok=True)
+            else:
+                result = fc_result
+            return _ok_chunk(result)
+
+        # ── trimesh path ─────────────────────────────────────────────────────
         if shape_type == "box":
             result = await asyncio.to_thread(
                 self._scene.create_box, name, length, width, height
@@ -370,9 +407,14 @@ class ExportModel(ToolBase):
         "properties": {
             "format": {
                 "type": "string",
-                "enum": ["stl", "obj"],
+                "enum": ["stl", "obj", "step"],
                 "default": "stl",
-                "description": "Output file format",
+                "description": (
+                    "Output file format. "
+                    "stl/obj: mesh formats for 3-D preview. "
+                    "step: standard parametric CAD format (via FreeCAD), "
+                    "ideal for sharing with other CAD tools."
+                ),
             }
         },
     }
@@ -388,6 +430,23 @@ class ExportModel(ToolBase):
         return _auto_allow()
 
     async def __call__(self, format: str = "stl", **_: Any) -> ToolChunk:  # type: ignore[override]
+        if format == "step":
+            # Export mesh to STL first, then convert to STEP via FreeCAD
+            stl_result = await asyncio.to_thread(self._scene.export_model, "stl")
+            if not stl_result.get("success"):
+                return _ok_chunk(stl_result)
+            stl_path = Path(stl_result["path"])
+            step_path = stl_path.with_suffix(".step")
+            fc_result = await freecad_bridge.stl_to_step(stl_path, step_path)
+            if fc_result.get("success"):
+                fc_result.update({
+                    "filename": step_path.name,
+                    "path": str(step_path),
+                    "format": "step",
+                    "vertices": stl_result.get("vertices"),
+                    "faces": stl_result.get("faces"),
+                })
+            return _ok_chunk(fc_result)
         result = await asyncio.to_thread(self._scene.export_model, format)
         return _ok_chunk(result)
 

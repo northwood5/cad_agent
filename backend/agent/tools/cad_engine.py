@@ -306,6 +306,21 @@ class CADScene:
             "faces": len(combined.faces),
         }
 
+    def load_stl_into_scene(self, name: str, stl_path: Path) -> dict[str, Any]:
+        """Load an STL file produced by FreeCAD back into the trimesh scene."""
+        loaded = trimesh.load(str(stl_path))
+        if isinstance(loaded, trimesh.Scene):
+            mesh = trimesh.util.concatenate(list(loaded.geometry.values()))
+        else:
+            mesh = loaded
+        self.shapes[name] = mesh
+        return {
+            "success": True,
+            "name": name,
+            "vertices": len(mesh.vertices),
+            "faces": len(mesh.faces),
+        }
+
     def reset_scene(self) -> dict[str, Any]:
         cleared = len(self.shapes)
         self.shapes.clear()
