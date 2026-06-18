@@ -9,7 +9,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from agentscope.agent import Agent
+from agentscope.agent import Agent, ReActConfig
+from agentscope.agent._config import ContextConfig
 from agentscope.model import (
     ChatModelBase,
     OpenAIChatModel,
@@ -161,5 +162,7 @@ def build_agent(
         system_prompt=SYSTEM_PROMPT,
         model=model,
         toolkit=toolkit,
+        react_config=ReActConfig(max_iters=200),
+        context_config=ContextConfig(tool_result_limit=30000),
     )
     return agent, scene
