@@ -29,6 +29,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
+from agent.tools import freecad_bridge
+
 from agentscope.event import (
     TextBlockDeltaEvent,
     TextBlockStartEvent,
@@ -367,6 +369,50 @@ async def serve_model(session_id: str, filename: str):
         str(filepath),
         media_type=media,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── REST: on-demand STEP export ─────────────────────────────────────────────
+
+@app.get("/api/sessions/{session_id}/export/step")
+async def export_step(session_id: str):
+    """Export the current session's FreeCAD document as a STEP file on demand."""
+    sess = _sessions.get(session_id)
+    if not sess:
+        return JSONResponse({"error": "session not found"}, status_code=404)
+
+    scene = sess["scene"]
+    if not scene.shapes:
+        return JSONResponse({"error": "scene is empty"}, status_code=400)
+
+    out_dir = OUTPUT_DIR / session_id
+    step_path = out_dir / f"export_{uuid.uuid4().hex[:8]}.step"
+
+    if scene.fc_doc_path.exists():
+        result = await freecad_bridge.fc_export_step(scene.fc_doc_path, step_path)
+    else:
+        # Fallback: export trimesh STL then convert
+        import trimesh, trimesh.util
+        shapes = list(scene.shapes.values())
+        merged = shapes[0] if len(shapes) == 1 else trimesh.util.concatenate(shapes)
+        tmp_stl = out_dir / f"_tmp_{uuid.uuid4().hex[:8]}.stl"
+        merged.export(str(tmp_stl))
+        result = await freecad_bridge.stl_to_step(tmp_stl, step_path)
+        tmp_stl.unlink(missing_ok=True)
+
+    if not result.get("success"):
+        return JSONResponse({"error": result.get("error", "Export failed")}, status_code=500)
+
+    entry = {
+        "filename": step_path.name,
+        "url": f"/api/models/{session_id}/{step_path.name}",
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    }
+    sess["model_history"].append(entry)
+    return FileResponse(
+        str(step_path),
+        media_type="application/step",
+        headers={"Content-Disposition": f'attachment; filename="{step_path.name}"'},
     )
 
 

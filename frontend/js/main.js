@@ -30,6 +30,7 @@ const traceClear      = document.getElementById('trace-clear');
 const llmBadge        = document.getElementById('llm-badge');
 const llmBadgeText    = document.getElementById('llm-badge-text');
 const downloadStlBtn  = document.getElementById('btn-download-stl');
+const downloadStepBtn = document.getElementById('btn-download-step');
 const historyToggle   = document.getElementById('btn-history-toggle');
 const historyPanel    = document.getElementById('history-panel');
 const historyClose    = document.getElementById('history-close');
@@ -61,9 +62,10 @@ function addToHistory(entry) {
   _modelHistory.push(entry);
   _currentModelUrl = entry.url;
 
-  // Enable download button
+  // Enable download buttons
   downloadStlBtn.disabled = false;
   downloadStlBtn.title = `下载 ${entry.filename}`;
+  downloadStepBtn.disabled = false;
 
   // Re-render history list
   renderHistory();
@@ -113,9 +115,40 @@ downloadStlBtn.addEventListener('click', () => {
   if (!_currentModelUrl) return;
   const a = document.createElement('a');
   a.href = _currentModelUrl;
-  const fname = _currentModelUrl.split('/').pop();
-  a.download = fname;
+  a.download = _currentModelUrl.split('/').pop();
   a.click();
+});
+
+// ── Download STEP ─────────────────────────────────────────────────────────────
+downloadStepBtn.addEventListener('click', async () => {
+  if (downloadStepBtn.disabled) return;
+  const orig = downloadStepBtn.textContent;
+  downloadStepBtn.textContent = '导出中…';
+  downloadStepBtn.disabled = true;
+  try {
+    const res = await fetch(`/api/sessions/${SESSION_ID}/export/step`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      chat.addSystem(`STEP 导出失败: ${err.error || res.statusText}`);
+      return;
+    }
+    const blob = await res.blob();
+    const disp = res.headers.get('Content-Disposition') || '';
+    const match = disp.match(/filename="([^"]+)"/);
+    const fname = match ? match[1] : `export_${SESSION_ID.slice(0, 8)}.step`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    a.click();
+    URL.revokeObjectURL(url);
+    chat.addSystem(`STEP 文件已下载：${fname}`);
+  } catch (e) {
+    chat.addSystem(`STEP 导出错误: ${e.message}`);
+  } finally {
+    downloadStepBtn.textContent = orig;
+    downloadStepBtn.disabled = false;
+  }
 });
 
 // ── WebSocket ──────────────────────────────────────────────────────────────────
@@ -189,6 +222,7 @@ function handleEvent(evt) {
       _modelHistory = [];
       _currentModelUrl = null;
       downloadStlBtn.disabled = true;
+      downloadStepBtn.disabled = true;
       renderHistory();
       trace.addInfo(`新会话  session=${evt.session_id.slice(0, 8)}…`);
       break;
@@ -344,6 +378,7 @@ saveConfigBtn.addEventListener('click', async () => {
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 setSendEnabled(false);
+downloadStepBtn.disabled = true;
 chat.addSystem('正在连接服务…');
 connectWS();
 

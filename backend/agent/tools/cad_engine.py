@@ -43,6 +43,11 @@ class CADScene:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.shapes: dict[str, trimesh.Trimesh] = {}
 
+    @property
+    def fc_doc_path(self) -> Path:
+        """Path to the FreeCAD session document (shared across all operations)."""
+        return self.output_dir / "scene.FCStd"
+
     # ------------------------------------------------------------------
     # Primitives
     # ------------------------------------------------------------------
