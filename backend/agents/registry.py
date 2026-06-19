@@ -19,9 +19,9 @@ from .post.agent import PostSpecialist
 # name -> SpecialistAgent subclass
 AGENT_REGISTRY: dict[str, type[SpecialistAgent]] = {
     CADSpecialist.name: CADSpecialist,
-    MeshSpecialist.name: MeshSpecialist,   # stub
-    CAESpecialist.name: CAESpecialist,     # stub
-    PostSpecialist.name: PostSpecialist,   # stub
+    MeshSpecialist.name: MeshSpecialist,
+    CAESpecialist.name: CAESpecialist,
+    PostSpecialist.name: PostSpecialist,
 }
 
 

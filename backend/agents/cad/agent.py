@@ -144,3 +144,18 @@ class CADSpecialist(SpecialistAgent):
             )
             if matches:
                 context.record(kind, matches[0])
+        # Store bounding box size hint for the mesh agent's characteristic length.
+        shapes = self.scene.list_shapes()
+        if shapes.get("count", 0) > 0:
+            import math
+            all_bounds = [s["bounds"] for s in shapes["shapes"] if s.get("bounds")]
+            if all_bounds:
+                xs = [b[0][0] for b in all_bounds] + [b[1][0] for b in all_bounds]
+                ys = [b[0][1] for b in all_bounds] + [b[1][1] for b in all_bounds]
+                zs = [b[0][2] for b in all_bounds] + [b[1][2] for b in all_bounds]
+                bbox_size = math.sqrt(
+                    (max(xs) - min(xs)) ** 2
+                    + (max(ys) - min(ys)) ** 2
+                    + (max(zs) - min(zs)) ** 2
+                )
+                context.scratch["bbox_size"] = max(bbox_size, 1.0)

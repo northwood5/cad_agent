@@ -37,13 +37,20 @@ logger = logging.getLogger(__name__)
 
 
 class WorkflowController:
-    """Carries an interrupt signal shared between the WS handler and a run."""
+    """Carries interrupt + breakpoint signals shared between WS handler and a run."""
 
     def __init__(self) -> None:
         self._interrupt = asyncio.Event()
+        self._breakpoints: set[str] = set()
+        self._resume_events: dict[str, asyncio.Event] = {}
+        self._resume_instructions: dict[str, str] = {}
 
+    # ── interrupt ────────────────────────────────────────────────────────────
     def interrupt(self) -> None:
         self._interrupt.set()
+        # Wake up any nodes waiting at a breakpoint so they can exit.
+        for ev in list(self._resume_events.values()):
+            ev.set()
 
     def reset(self) -> None:
         self._interrupt.clear()
@@ -51,6 +58,32 @@ class WorkflowController:
     @property
     def interrupted(self) -> bool:
         return self._interrupt.is_set()
+
+    # ── breakpoints ──────────────────────────────────────────────────────────
+    def set_breakpoint(self, node_id: str) -> None:
+        self._breakpoints.add(node_id)
+
+    def remove_breakpoint(self, node_id: str) -> None:
+        self._breakpoints.discard(node_id)
+
+    def has_breakpoint(self, node_id: str) -> bool:
+        return node_id in self._breakpoints
+
+    async def wait_at_breakpoint(self, node_id: str) -> str | None:
+        """Block until resume() is called. Returns override instruction or None."""
+        event = asyncio.Event()
+        self._resume_events[node_id] = event
+        await event.wait()
+        del self._resume_events[node_id]
+        return self._resume_instructions.pop(node_id, None)
+
+    def resume(self, node_id: str, instruction: str | None = None) -> None:
+        """Resume a node that is paused at a breakpoint, optionally with new instruction."""
+        if instruction is not None:
+            self._resume_instructions[node_id] = instruction
+        ev = self._resume_events.pop(node_id, None)
+        if ev:
+            ev.set()
 
 
 class WorkflowService:
@@ -106,7 +139,8 @@ class WorkflowService:
     # ── Reset / rerun from a node ────────────────────────────────────────────
 
     async def rerun_from(
-        self, node_id: str, controller: WorkflowController | None = None
+        self, node_id: str, controller: WorkflowController | None = None,
+        override_instruction: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         controller = controller or WorkflowController()
         if self._workflow is None or self._run_id is None:
@@ -120,6 +154,10 @@ class WorkflowService:
             return
 
         subset = nodes[idx:]
+        # Apply override instruction to the target node only.
+        if override_instruction:
+            subset[0].instruction = override_instruction
+
         for n in subset:
             n.status = "pending"
             repo.set_node_status(self._node_db_ids[n.id], "pending")
@@ -148,6 +186,20 @@ class WorkflowService:
             if controller.interrupted:
                 interrupted = True
                 break
+
+            # Pause at breakpoint — wait for resume (optionally with new instruction).
+            if controller.has_breakpoint(node.id):
+                yield {"type": "workflow_node_paused", "run_id": run_id,
+                       "node_id": node.id, "agent": node.agent, "title": node.title}
+                override = await controller.wait_at_breakpoint(node.id)
+                if controller.interrupted:
+                    interrupted = True
+                    break
+                if override:
+                    node.instruction = override
+                    yield {"type": "workflow_node_instruction_updated",
+                           "run_id": run_id, "node_id": node.id,
+                           "instruction": node.instruction}
 
             specialist = self.session.get_specialist(node.agent)
             yield {"type": "workflow_node_start", "run_id": run_id,
@@ -201,14 +253,27 @@ class WorkflowService:
                         payload = event_to_json(evt, call_buf, res_buf,
                                                 node_id=node.id, agent=node.agent)
                     if payload:
-                        if payload["type"] == "text_delta":
+                        ptype = payload["type"]
+                        if ptype == "text_delta":
                             final_text += payload.get("text", "")
-                        if payload["type"] == "tool_result_end":
+                        if ptype == "tool_result_end":
                             art = self._artifact_from_result(payload.get("result", ""),
                                                              run_id, db_id, project_id)
                             if art:
                                 artifacts.append(art)
-                        yield payload
+                        if ptype == "artifact_produced":
+                            # Emitted by non-LLM agents (mesh/cae/post)
+                            filename = payload.get("filename")
+                            kind = payload.get("kind", "file")
+                            if filename:
+                                path = str(self.session.workspace / filename)
+                                repo.add_artifact(project_id, kind, filename, path,
+                                                  run_id=run_id, node_id=db_id)
+                                artifacts.append({"filename": filename, "kind": kind,
+                                                  "_emitted": False})
+                            # Don't forward raw artifact_produced to client
+                        else:
+                            yield payload
                         for art in artifacts:
                             if art.get("_emitted"):
                                 continue

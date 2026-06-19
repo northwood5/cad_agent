@@ -182,7 +182,34 @@ class OrchestratorAgent:
                     depends_on=[str(d) for d in item.get("depends_on", []) if d],
                 )
             )
-        return nodes
+        return self._merge_same_agent_nodes(nodes)
+
+    def _merge_same_agent_nodes(self, nodes: list[WorkflowNode]) -> list[WorkflowNode]:
+        """Merge consecutive nodes that use the same agent into a single sub-task.
+
+        Tasks that call the same tool/agent are treated as one sub-task type.
+        Their instructions are concatenated so the specialist receives the full context.
+        """
+        if not nodes:
+            return nodes
+        merged: list[WorkflowNode] = [nodes[0]]
+        for node in nodes[1:]:
+            last = merged[-1]
+            if node.agent == last.agent:
+                # Same agent: append this step's instruction to the existing node.
+                last.instruction = last.instruction.rstrip() + "\n\n" + node.instruction
+            else:
+                merged.append(node)
+        # Re-number ids and fix depends_on for the merged list.
+        id_map: dict[str, str] = {}
+        for i, node in enumerate(merged, 1):
+            new_id = f"n{i}"
+            id_map[node.id] = new_id
+            node.id = new_id
+        for node in merged:
+            node.depends_on = list({id_map.get(d, d) for d in node.depends_on
+                                     if id_map.get(d, d) != node.id})
+        return merged
 
     @staticmethod
     def _fallback_node(user_request: str) -> WorkflowNode:

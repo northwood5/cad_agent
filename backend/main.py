@@ -164,7 +164,7 @@ async def ws_chat(websocket: WebSocket, project_id: int):
                     state["controller"].interrupt()
                 continue
 
-            # ── reset / rerun from a node ──
+            # ── reset / rerun from a node (original instruction) ──
             if action == "reset_node":
                 if busy() or state["service"] is None:
                     continue
@@ -175,6 +175,42 @@ async def ws_chat(websocket: WebSocket, project_id: int):
                 state["controller"] = ctrl
                 gen = state["service"].rerun_from(node_id, ctrl)
                 state["task"] = asyncio.create_task(run_stream(gen))
+                continue
+
+            # ── rerun a node with a new natural-language instruction ──
+            if action == "reset_node_with_instruction":
+                if busy() or state["service"] is None:
+                    continue
+                node_id = data.get("node_id")
+                instruction = (data.get("instruction") or "").strip()
+                if not node_id or not instruction:
+                    continue
+                ctrl = WorkflowController()
+                state["controller"] = ctrl
+                gen = state["service"].rerun_from(node_id, ctrl, override_instruction=instruction)
+                state["task"] = asyncio.create_task(run_stream(gen))
+                continue
+
+            # ── set a breakpoint on a workflow node ──
+            if action == "set_breakpoint":
+                node_id = data.get("node_id")
+                if node_id and state["controller"] is not None:
+                    state["controller"].set_breakpoint(node_id)
+                continue
+
+            # ── remove a breakpoint from a workflow node ──
+            if action == "remove_breakpoint":
+                node_id = data.get("node_id")
+                if node_id and state["controller"] is not None:
+                    state["controller"].remove_breakpoint(node_id)
+                continue
+
+            # ── resume a node paused at a breakpoint ──
+            if action == "resume_node":
+                node_id = data.get("node_id")
+                instruction = (data.get("instruction") or "").strip() or None
+                if node_id and state["controller"] is not None:
+                    state["controller"].resume(node_id, instruction)
                 continue
 
             # ── reset project session (clears in-memory geometry state) ──

@@ -8,7 +8,7 @@
 import { ChatPanel }    from './chat.js';
 import { AgentTrace }   from './agent_trace.js';
 import { Tabs }         from './tabs.js';
-import { WorkflowView } from './workflow.js?v=6';
+import { WorkflowView } from './workflow.js?v=8';
 import { ScriptsView }  from './scripts.js?v=6';
 import { UserManager }  from './user.js';
 
@@ -41,7 +41,7 @@ const chat     = new ChatPanel(chatMsgsEl);
 const trace    = new AgentTrace(traceLogEl, traceDotEl);
 const tabs     = new Tabs();
 const workflow = new WorkflowView(
-  document.getElementById('workflow-list'),
+  document.getElementById('workflow-canvas'),
   document.getElementById('workflow-placeholder'),
 );
 const scripts  = new ScriptsView(
@@ -70,13 +70,28 @@ async function initViewer() {
 // When the viewer becomes visible after being hidden, fix its size.
 tabs.onSwitch((name) => { if (name === 'viewer' && viewer) viewer.resetView(); });
 
-// Per-node controls: interrupt the running workflow / rerun from a node.
-workflow.onInterrupt(() => {
+// Per-node controls: interrupt / reset / reset-with-instruction / breakpoint / resume.
+workflow.onInterrupt((nodeId) => {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: 'interrupt' }));
 });
 workflow.onReset((nodeId) => {
   if (agentBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ action: 'reset_node', node_id: nodeId }));
+});
+workflow.onResetWithInstruction((nodeId, instruction) => {
+  if (agentBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'reset_node_with_instruction', node_id: nodeId, instruction }));
+});
+workflow.onBreakpointToggle((nodeId, enabled) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    action: enabled ? 'set_breakpoint' : 'remove_breakpoint',
+    node_id: nodeId,
+  }));
+});
+workflow.onResume((nodeId, instruction) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'resume_node', node_id: nodeId, instruction: instruction || null }));
 });
 
 // ── Model history (per project) ────────────────────────────────────────────────
@@ -223,12 +238,21 @@ function handleEvent(evt) {
       workflow.setNodeStatus(evt.node_id, 'running');
       // Section header in the trace so tool events can be attributed to a node.
       trace.addInfo(`▶ ${(evt.agent || '').toUpperCase()}：${evt.title || evt.node_id}`);
+      tabs.notify('workflow');
       break;
     case 'workflow_node_done':
       workflow.setNodeDone(evt.node_id, evt.status, evt.summary, evt.artifacts);
       break;
     case 'workflow_node_reset':
       workflow.setNodeStatus(evt.node_id, 'pending');
+      break;
+    case 'workflow_node_paused':
+      workflow.setNodePaused(evt.node_id);
+      trace.addInfo(`⏸ 断点暂停：${(evt.agent || '').toUpperCase()} — ${evt.title || evt.node_id}`);
+      tabs.show('workflow');
+      break;
+    case 'workflow_node_instruction_updated':
+      workflow.updateNodeInstruction(evt.node_id, evt.instruction);
       break;
     case 'workflow_done':
       trace.addInfo(`工作流结束：${evt.status}`);
@@ -240,11 +264,16 @@ function handleEvent(evt) {
       tabs.notify('scripts');
       break;
 
-    // ── Model (Tab 2) — notice in chat only, not echoed to trace ──
+    // ── Model (Tab 2) ──
     case 'model_ready':
-      if (viewer && evt.filename && evt.filename.endsWith('.stl')) viewer.loadSTL(evt.url);
       addToHistory({ filename: evt.filename, url: evt.url, timestamp: now() });
-      tabs.notify('viewer');
+      // Auto-switch to the viewer tab so the model appears immediately.
+      tabs.show('viewer');
+      if (viewer && evt.filename && evt.filename.endsWith('.stl')) {
+        // Defer by one frame so the tab is fully visible before the renderer
+        // measures its container dimensions and the STL fetch begins.
+        requestAnimationFrame(() => viewer.loadSTL(evt.url));
+      }
       chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
       break;
 

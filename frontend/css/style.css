@@ -444,10 +444,10 @@ header h1 span { color: var(--accent); }
 }
 .tab-pane.active { display: flex; }
 
-/* ── Tab 1: Workflow ─────────────────────────────────────────────────────── */
+/* ── Tab 1: Workflow (graphical flow) ────────────────────────────────────── */
 #workflow-canvas {
-  flex: 1; overflow-y: auto; position: relative;
-  background: #0d1018; padding: 18px;
+  flex: 1; overflow: auto; position: relative;
+  background: #0d1018;
 }
 #workflow-placeholder {
   position: absolute; inset: 0;
@@ -455,83 +455,208 @@ header h1 span { color: var(--accent); }
   color: var(--text-muted); font-size: 13px; gap: 12px; pointer-events: none;
 }
 #workflow-placeholder .icon { font-size: 48px; opacity: .25; }
-#workflow-list { display: flex; flex-direction: column; gap: 0; }
 
-.wf-node {
-  display: flex; gap: 12px; position: relative;
+/* Root layout: track on top, detail panel below */
+.wfg-root {
+  display: flex; flex-direction: column; min-height: 100%;
 }
-.wf-rail { display: flex; flex-direction: column; align-items: center; flex-shrink: 0; }
-.wf-bullet {
-  width: 26px; height: 26px; border-radius: 50%;
+
+/* ── Pipeline track (horizontal) ─────────────────── */
+.wfg-track {
+  display: flex; align-items: center;
+  padding: 24px 28px; gap: 0;
+  border-bottom: 1px solid var(--border);
+  background: #0a0d14;
+  overflow-x: auto; flex-shrink: 0;
+  min-height: 120px;
+}
+.wfg-track::-webkit-scrollbar { height: 4px; }
+
+/* Arrow connector between nodes */
+.wfg-arrow {
+  flex: 1; min-width: 20px; max-width: 60px;
+  height: 2px; background: var(--border); position: relative; flex-shrink: 0;
+}
+.wfg-arrow::after {
+  content: ''; position: absolute; right: -5px; top: -4px;
+  border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+  border-left: 7px solid var(--border);
+}
+
+/* Start / End terminus */
+.wfg-terminus {
+  width: 32px; height: 32px; border-radius: 50%;
+  background: var(--bg-input); border: 2px solid var(--border);
   display: flex; align-items: center; justify-content: center;
-  font-size: 13px; border: 2px solid var(--border);
-  background: var(--bg-panel); color: var(--text-muted);
-  flex-shrink: 0; z-index: 1; transition: all .25s;
+  color: var(--text-muted); flex-shrink: 0;
 }
-.wf-connector { width: 2px; flex: 1; background: var(--border); min-height: 14px; }
-.wf-node:last-child .wf-connector { display: none; }
+.wfg-terminus-end { opacity: .6; }
 
-.wf-node.pending  .wf-bullet { }
-.wf-node.running  .wf-bullet { border-color: var(--accent); color: var(--accent);
-  animation: pulse 1.2s infinite; box-shadow: 0 0 0 4px rgba(79,142,247,.12); }
-.wf-node.success  .wf-bullet { border-color: var(--green); color: var(--green); background: #14271f; }
-.wf-node.failed   .wf-bullet { border-color: var(--red); color: var(--red); background: #2a1414; }
-.wf-node.skipped  .wf-bullet { border-color: var(--border); color: var(--text-muted); opacity: .6; }
+/* ── Pipeline node (icon + label in track) ─────── */
+.wfg-pipe-node {
+  display: flex; flex-direction: column; align-items: center;
+  gap: 6px; cursor: pointer; position: relative;
+  padding: 6px 10px; border-radius: var(--radius);
+  border: 1px solid transparent; transition: border-color .2s, background .2s;
+  flex-shrink: 0; min-width: 76px;
+}
+.wfg-pipe-node:hover { background: rgba(255,255,255,.04); border-color: var(--border); }
+.wfg-pipe-node.wfg-pipe-selected { background: rgba(79,142,247,.08); border-color: var(--accent); }
 
-.wf-body {
-  flex: 1; padding-bottom: 16px; min-width: 0;
+/* Agent icon container */
+.wfg-pipe-icon {
+  position: relative; width: 52px; height: 52px;
+  background: var(--agent-bg, #0e2018); border-radius: 50%;
+  border: 2px solid var(--agent-color, #4caf88);
+  display: flex; align-items: center; justify-content: center;
+  transition: box-shadow .3s;
 }
-.wf-card {
-  background: var(--bg-panel); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 11px 13px;
-  transition: border-color .2s;
-}
-.wf-node.running .wf-card { border-color: var(--accent); }
-.wf-card-head { display: flex; align-items: center; gap: 8px; }
-.wf-agent-badge {
-  font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 4px;
-  text-transform: uppercase; letter-spacing: .4px; flex-shrink: 0;
-}
-.badge-cad  { background: #1a3a2a; color: var(--green); }
-.badge-mesh { background: #2a2060; color: #9b8fff; }
-.badge-cae  { background: #3a2a1a; color: var(--orange); }
-.wf-title { font-size: 13.5px; font-weight: 600; color: var(--text); flex: 1; }
-.wf-status-icon { font-size: 13px; flex-shrink: 0; }
+.wfg-pipe-icon svg { width: 32px; height: 32px; }
 
-/* Per-node controls (interrupt / reset) */
-.wf-controls { display: flex; gap: 4px; flex-shrink: 0; }
-.wf-btn {
-  font-size: 11px; padding: 2px 8px; border-radius: 4px;
-  border: 1px solid var(--border); background: var(--bg-input);
-  color: var(--text-muted); cursor: pointer; white-space: nowrap;
-  transition: color .15s, border-color .15s, background .15s;
+/* Status ring overlay (animated when running) */
+.wfg-pipe-status-ring {
+  position: absolute; inset: -4px; border-radius: 50%;
+  border: 2px solid transparent; pointer-events: none;
+  transition: border-color .3s;
 }
-.wf-btn:hover { color: var(--text); border-color: var(--accent); }
-.wf-btn.js-interrupt:hover { color: var(--orange); border-color: var(--orange); }
-.wf-btn.js-reset:hover { color: var(--accent); border-color: var(--accent); }
-/* Show 中断 only while running; show 重置 only once finished. */
-.wf-controls .js-interrupt,
-.wf-controls .js-reset { display: none; }
-.wf-node.running  .js-interrupt { display: inline-block; }
-.wf-node.success  .js-reset,
-.wf-node.failed   .js-reset,
-.wf-node.interrupted .js-reset { display: inline-block; }
-.wf-instruction {
-  font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.5;
+
+/* Agent label + title under icon */
+.wfg-pipe-badge {
+  font-size: 9px; font-weight: 700; letter-spacing: .6px;
+  text-transform: uppercase;
+}
+.wfg-pipe-title {
+  font-size: 11px; color: var(--text-muted); text-align: center;
+  max-width: 80px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* Breakpoint indicator dot (top-right of icon) */
+.wfg-bp-indicator {
+  position: absolute; top: 4px; right: 4px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: transparent; border: 1.5px solid var(--text-muted);
+  transition: background .2s, border-color .2s;
+}
+.wfg-bp-indicator.on { background: var(--red); border-color: var(--red); }
+
+/* ── Node status classes ────────────────────────── */
+.wfg-status-pending  .wfg-pipe-icon { opacity: .55; }
+.wfg-status-running  .wfg-pipe-icon { box-shadow: 0 0 0 4px rgba(79,142,247,.2); }
+.wfg-status-running  .wfg-pipe-status-ring {
+  border-color: var(--accent); animation: spin 2s linear infinite;
+}
+.wfg-status-success  .wfg-pipe-icon { box-shadow: 0 0 0 3px rgba(76,175,136,.25); }
+.wfg-status-failed   .wfg-pipe-icon { box-shadow: 0 0 0 3px rgba(224,82,82,.25); }
+.wfg-status-interrupted .wfg-pipe-icon { opacity: .7; }
+.wfg-status-paused   .wfg-pipe-icon { box-shadow: 0 0 0 4px rgba(245,166,35,.3); }
+.wfg-status-paused   .wfg-pipe-status-ring {
+  border-color: var(--orange); animation: pulse 1.5s infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Detail panel (below track) ─────────────────── */
+.wfg-detail {
+  flex: 1; overflow-y: auto; padding: 20px 24px;
+  display: flex; flex-direction: column; gap: 12px;
+  background: #0d1018;
+}
+.wfg-detail-empty {
+  color: var(--text-muted); font-size: 12px; opacity: .6; text-align: center;
+  padding-top: 20px;
+}
+
+.wfg-detail-head {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+}
+.wfg-detail-agent-icon {
+  width: 44px; height: 44px; flex-shrink: 0;
+  background: var(--agent-bg, #0e2018); border-radius: 50%;
+  border: 1.5px solid var(--agent-color, #4caf88);
+  display: flex; align-items: center; justify-content: center;
+}
+.wfg-detail-agent-icon svg { width: 28px; height: 28px; }
+.wfg-detail-info { flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.wfg-detail-badge {
+  font-size: 10px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase;
+  border: 1px solid; border-radius: 4px; display: inline-block;
+  padding: 1px 7px; width: fit-content;
+}
+.wfg-detail-title { font-size: 14px; font-weight: 600; color: var(--text); }
+
+/* Status chip */
+.wfg-detail-status-chip {
+  font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px;
+  flex-shrink: 0; border: 1px solid;
+}
+.wfg-status-chip-pending     { color: var(--text-muted); border-color: var(--border); }
+.wfg-status-chip-running     { color: var(--accent);  border-color: var(--accent); animation: pulse 1.2s infinite; }
+.wfg-status-chip-success     { color: var(--green);   border-color: var(--green);  background: rgba(76,175,136,.1); }
+.wfg-status-chip-failed      { color: var(--red);     border-color: var(--red);    background: rgba(224,82,82,.1); }
+.wfg-status-chip-interrupted { color: var(--orange);  border-color: var(--orange); }
+.wfg-status-chip-paused      { color: var(--orange);  border-color: var(--orange); background: rgba(245,166,35,.1); animation: pulse 1.5s infinite; }
+.wfg-status-chip-skipped     { color: var(--text-muted); border-color: var(--border); opacity: .6; }
+
+.wfg-detail-section-label {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .5px; color: var(--text-muted); margin-top: 4px;
+}
+.wfg-detail-instruction {
+  font-size: 12.5px; color: var(--text); line-height: 1.65;
   white-space: pre-wrap; word-break: break-word;
-}
-.wf-summary {
-  font-size: 12px; color: var(--text); margin-top: 8px; padding-top: 8px;
-  border-top: 1px dashed var(--border); line-height: 1.5;
-  white-space: pre-wrap; word-break: break-word;
-}
-.wf-artifacts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-.wf-artifact {
-  font-size: 11px; color: var(--accent); text-decoration: none;
   background: var(--bg-input); border: 1px solid var(--border);
-  border-radius: 4px; padding: 2px 8px; font-family: monospace;
+  border-radius: var(--radius); padding: 10px 12px;
 }
-.wf-artifact:hover { border-color: var(--accent); }
+.wfg-detail-summary {
+  font-size: 12.5px; color: var(--text); line-height: 1.65;
+  white-space: pre-wrap; word-break: break-word;
+  border-left: 2px solid var(--green); padding-left: 10px;
+}
+.wfg-detail-artifacts { display: flex; flex-wrap: wrap; gap: 6px; }
+.wfg-artifact-link {
+  font-size: 11.5px; font-family: monospace; color: var(--accent);
+  text-decoration: none; background: var(--bg-input);
+  border: 1px solid var(--border); border-radius: 4px; padding: 3px 9px;
+}
+.wfg-artifact-link:hover { border-color: var(--accent); text-decoration: underline; }
+
+/* ── Control buttons ─────────────────────────────── */
+.wfg-detail-controls { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.wfg-ctrl-btn {
+  font-size: 12px; padding: 5px 13px; border-radius: 5px;
+  border: 1px solid var(--border); background: var(--bg-input);
+  color: var(--text-muted); cursor: pointer; transition: all .15s;
+  display: flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-family: inherit;
+}
+.wfg-ctrl-btn:hover { color: var(--text); border-color: var(--accent); }
+.wfg-ctrl-bp.active { color: var(--red); border-color: var(--red); }
+.wfg-ctrl-interrupt:hover { color: var(--orange); border-color: var(--orange); }
+.wfg-ctrl-reset:hover { color: var(--accent); border-color: var(--accent); }
+.wfg-ctrl-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.wfg-ctrl-primary:hover { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
+
+.wfg-bp-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid currentColor; flex-shrink: 0; display: inline-block;
+}
+.wfg-bp-dot.on { background: var(--red); border-color: var(--red); }
+
+/* ── Re-input form (paused / interrupted) ────────── */
+.wfg-reinput-form {
+  background: rgba(245,166,35,.07); border: 1px solid var(--orange);
+  border-radius: var(--radius); padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.wfg-reinput-label { font-size: 12px; color: var(--orange); line-height: 1.5; }
+.wfg-reinput-textarea {
+  background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius); color: var(--text); font-family: inherit;
+  font-size: 13px; padding: 9px 12px; resize: vertical; outline: none;
+  transition: border-color .15s;
+}
+.wfg-reinput-textarea:focus { border-color: var(--orange); }
+.wfg-reinput-actions { display: flex; justify-content: flex-end; }
 
 /* ── Tab 3: Scripts ──────────────────────────────────────────────────────── */
 #scripts-toolbar {
