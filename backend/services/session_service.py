@@ -32,7 +32,7 @@ class ProjectSession:
             cls = get_specialist_cls(name)
             if cls is None:
                 return None
-            self._specialists[name] = cls(self.llm_config, self.workspace)
+            self._specialists[name] = cls(self.llm_config, self.workspace / name)
             logger.info("Instantiated specialist '%s' for project %s", name, self.project_id)
         return self._specialists[name]
 

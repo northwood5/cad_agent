@@ -16,6 +16,7 @@ export class ScriptsView {
     this._pre = null;
     this._countEl = null;
     this._scripts = [];
+    this._seen = new Set();
   }
 
   clear() {
@@ -27,6 +28,12 @@ export class ScriptsView {
     this._pre = null;
     this._countEl = null;
     this._scripts = [];
+    this._seen = new Set();
+  }
+
+  _key(script) {
+    return [script.agent, script.software, script.filename,
+            (script.content || '').length].join('|');
   }
 
   get count() { return this._scripts.length; }
@@ -70,6 +77,12 @@ export class ScriptsView {
 
   /** Append one script to the single text window (newest at the bottom). */
   add(script) {
+    // Skip duplicates so events replayed on reconnect don't double up scripts
+    // already restored from the DB via hydrate().
+    const key = this._key(script);
+    if (this._seen.has(key)) return;
+    this._seen.add(key);
+
     this._ensureView();
     this._scripts.push(script);
     const idx = this._scripts.length;

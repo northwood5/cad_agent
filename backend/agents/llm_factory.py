@@ -26,7 +26,10 @@ from agentscope.credential import (
     DeepSeekCredential,
 )
 
-SUPPORTED_PROVIDERS = ["openai", "anthropic", "dashscope", "ollama", "deepseek"]
+SUPPORTED_PROVIDERS = ["openai", "anthropic", "dashscope", "ollama", "deepseek", "zhipu"]
+
+# Zhipu AI (GLM) uses an OpenAI-compatible API.
+_ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
 
 
 def build_model(config: dict[str, Any]) -> ChatModelBase:
@@ -35,7 +38,7 @@ def build_model(config: dict[str, Any]) -> ChatModelBase:
 
     Config fields:
         provider  : one of SUPPORTED_PROVIDERS
-        model_name: e.g. "gpt-4o", "claude-sonnet-4-6", "qwen-plus"
+        model_name: e.g. "gpt-4o", "claude-sonnet-4-6", "GLM-5", "qwen-plus"
         api_key   : (not needed for Ollama)
         base_url  : optional override (OpenAI-compatible endpoints, Ollama host, …)
         stream    : bool (default True)
@@ -66,6 +69,12 @@ def build_model(config: dict[str, Any]) -> ChatModelBase:
     elif provider == "deepseek":
         cred = DeepSeekCredential(api_key=api_key)
         return DeepSeekChatModel(credential=cred, model=model_name, stream=stream)
+
+    elif provider == "zhipu":
+        # Zhipu AI (GLM series) exposes an OpenAI-compatible chat endpoint.
+        effective_base = base_url or _ZHIPU_BASE_URL
+        cred = OpenAICredential(api_key=api_key, base_url=effective_base)
+        return OpenAIChatModel(credential=cred, model=model_name, stream=stream)
 
     else:
         raise ValueError(

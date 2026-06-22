@@ -73,6 +73,18 @@ CREATE TABLE IF NOT EXISTS workflow_nodes (
     finished_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS workflow_loopbacks (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        INTEGER NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+    iteration     INTEGER NOT NULL,            -- global repair iteration counter
+    from_node     TEXT NOT NULL,               -- node_key that failed / was reviewed
+    to_node       TEXT NOT NULL,               -- node_key execution jumped back to
+    target_agent  TEXT NOT NULL,               -- cad | mesh | cae
+    reason        TEXT,                         -- review rationale
+    instruction   TEXT,                         -- corrective instruction injected
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -101,6 +113,7 @@ CREATE INDEX IF NOT EXISTS idx_projects_user      ON projects(user_id);
 CREATE INDEX IF NOT EXISTS idx_messages_project   ON messages(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_project       ON workflow_runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_run          ON workflow_nodes(run_id);
+CREATE INDEX IF NOT EXISTS idx_loopbacks_run       ON workflow_loopbacks(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_project  ON artifacts(project_id);
 CREATE INDEX IF NOT EXISTS idx_scripts_project    ON scripts(project_id);
 """

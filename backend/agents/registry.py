@@ -12,6 +12,7 @@ from typing import Any
 
 from .base import SpecialistAgent
 from .cad.agent import CADSpecialist
+from .geom_clean.agent import GeomCleanSpecialist
 from .mesh.agent import MeshSpecialist
 from .cae.agent import CAESpecialist
 from .post.agent import PostSpecialist
@@ -19,6 +20,7 @@ from .post.agent import PostSpecialist
 # name -> SpecialistAgent subclass
 AGENT_REGISTRY: dict[str, type[SpecialistAgent]] = {
     CADSpecialist.name: CADSpecialist,
+    GeomCleanSpecialist.name: GeomCleanSpecialist,
     MeshSpecialist.name: MeshSpecialist,
     CAESpecialist.name: CAESpecialist,
     PostSpecialist.name: PostSpecialist,

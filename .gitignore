@@ -21,6 +21,8 @@ backend/output/
 # ── API Keys / secrets ──────────────────────────────────────────────────────
 .env
 .env.*
+# keep the committable template
+!.env.example
 backend/config/llm_config.yaml
 
 # ── OS / editor ──────────────────────────────────────────────────────────────

@@ -215,6 +215,40 @@ def set_node_status(
         )
 
 
+# ── Workflow loop-backs (self-healing audit trail) ────────────────────────────
+
+def add_loopback(
+    run_id: int,
+    iteration: int,
+    from_node: str,
+    to_node: str,
+    target_agent: str,
+    reason: str | None = None,
+    instruction: str | None = None,
+) -> dict[str, Any]:
+    conn = get_conn()
+    with lock():
+        cur = conn.execute(
+            """INSERT INTO workflow_loopbacks
+               (run_id, iteration, from_node, to_node, target_agent, reason, instruction)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_id, iteration, from_node, to_node, target_agent, reason, instruction),
+        )
+        lid = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM workflow_loopbacks WHERE id = ?", (lid,)
+        ).fetchone()
+    return _row(row)
+
+
+def list_loopbacks(run_id: int) -> list[dict[str, Any]]:
+    rows = get_conn().execute(
+        "SELECT * FROM workflow_loopbacks WHERE run_id = ? ORDER BY id ASC",
+        (run_id,),
+    ).fetchall()
+    return _rows(rows)
+
+
 # ── Artifacts ─────────────────────────────────────────────────────────────────
 
 def add_artifact(

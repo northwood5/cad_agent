@@ -40,6 +40,37 @@ class TaskContext:
         self.artifacts[kind] = path
 
 
+@dataclass
+class NodeOutcome:
+    """Structured result of running one workflow node.
+
+    Specialists signal this by yielding a ``{"type": "node_result", ...}`` event
+    at the end of :meth:`SpecialistAgent.run`. The WorkflowService captures it to
+    decide whether to advance, retry, or loop back to an upstream node — instead
+    of relying on "no exception raised == success" (which silently passed failed
+    mesh/CAE nodes before).
+
+    kind:
+      "ok"      — node succeeded
+      "error"   — hard failure (mesh生成失败 / 求解器报错)
+      "quality" — completed but results need a quality review (e.g. CAE metrics)
+    """
+
+    ok: bool = True
+    kind: str = "ok"                       # ok | error | quality
+    error: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_event(cls, evt: dict[str, Any]) -> "NodeOutcome":
+        return cls(
+            ok=bool(evt.get("ok", True)),
+            kind=str(evt.get("kind") or ("ok" if evt.get("ok", True) else "error")),
+            error=str(evt.get("error") or ""),
+            diagnostics=evt.get("diagnostics") or {},
+        )
+
+
 class SpecialistAgent(ABC):
     """Base class for CAD / mesh / CAE (and future) domain agents."""
 
@@ -53,6 +84,9 @@ class SpecialistAgent(ABC):
     input_kinds: list[str] = ["text"]
     #: artifact kinds this agent produces
     output_kinds: list[str] = []
+    #: when True, a successful run still triggers an LLM quality review (e.g. CAE
+    #: results may solve fine yet be physically unreasonable → loop back upstream)
+    quality_gate: bool = False
 
     def __init__(self, llm_config: dict[str, Any], workspace: Path) -> None:
         self.llm_config = llm_config

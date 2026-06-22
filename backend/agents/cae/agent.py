@@ -55,6 +55,35 @@ def _parse_force(text: str) -> float:
     return -1000.0
 
 
+def _trim_deck(deck: str, head: int = 12) -> str:
+    """Collapse long *Node / *Element data blocks so the script log stays readable."""
+    out: list[str] = []
+    kept = 0
+    in_data = False
+    skipped = 0
+    for line in deck.splitlines():
+        is_keyword = line.lstrip().startswith("*")
+        if is_keyword:
+            if in_data and skipped:
+                out.append(f"    ... (省略 {skipped} 行数据)")
+            in_data = line.lstrip().lower().startswith(("*node", "*element", "*nset"))
+            kept = 0
+            skipped = 0
+            out.append(line)
+            continue
+        if in_data:
+            if kept < head:
+                out.append(line)
+                kept += 1
+            else:
+                skipped += 1
+        else:
+            out.append(line)
+    if in_data and skipped:
+        out.append(f"    ... (省略 {skipped} 行数据)")
+    return "\n".join(out)
+
+
 # ── agent ────────────────────────────────────────────────────────────────────
 
 class CAESpecialist(SpecialistAgent):
@@ -66,6 +95,9 @@ class CAESpecialist(SpecialistAgent):
     )
     input_kinds = ["mesh"]
     output_kinds = ["result"]
+    # CAE may solve cleanly yet produce physically unreasonable numbers; flag the
+    # node for an LLM quality review so the workflow can loop back if needed.
+    quality_gate = True
 
     async def run(self, instruction: str, context: TaskContext):
         mesh_result = context.scratch.get("mesh_result")
@@ -76,10 +108,27 @@ class CAESpecialist(SpecialistAgent):
                 "text": "错误：未找到网格数据（需要先执行 MESH 节点）。",
             }
             yield {"type": "text_end"}
+            yield {"type": "node_result", "ok": False, "kind": "error",
+                   "error": "上游缺少网格数据（mesh_result）；需要先成功执行 MESH 节点。",
+                   "diagnostics": {}}
             return
 
         material      = _parse_material(instruction)
         total_force_z = _parse_force(instruction)
+
+        n_fix  = len(mesh_result.get("fix_nodes", []))
+        n_load = len(mesh_result.get("load_nodes", []))
+
+        # ── Reasoning → 推理面板 ────────────────────────────────────────────
+        yield {"type": "thinking_start"}
+        yield {"type": "thinking_delta", "text": (
+            f"分析类型：线弹性静力（*Static），求解器 CalculiX。\n"
+            f"从指令解析材料：{material['name']}  E={material['E']} MPa  ν={material['nu']}。\n"
+            f"从指令解析载荷：{abs(total_force_z):.0f} N（Z 方向）。\n"
+            f"边界条件：固定端 {n_fix} 节点（全约束），加载端 {n_load} 节点（均分集中力）。\n"
+            f"步骤：写 CalculiX .inp 算例 → 运行 ccx → 解析 .frd → 提取位移/Von Mises 应力。"
+        )}
+        yield {"type": "thinking_end"}
 
         yield {"type": "text_start"}
         yield {
@@ -99,15 +148,41 @@ class CAESpecialist(SpecialistAgent):
             job_name="cae_result",
         )
 
+        # The .inp deck written by the bridge is the real script sent to ccx.
+        inp_path = result.get("inp_path")
+        if inp_path:
+            try:
+                deck = Path(inp_path).read_text(encoding="utf-8", errors="replace")
+                yield {"type": "script_generated", "software": "calculix",
+                       "language": "inp", "content": _trim_deck(deck)}
+            except OSError:
+                pass
+        yield {"type": "script_generated", "software": "calculix", "language": "bash",
+               "content": f"# 运行 CalculiX 求解器\nccx -i cae_result"}
+
         if not result["success"]:
             err = result.get("error", "未知错误")
             yield {"type": "text_delta", "text": f"分析失败：{err}\n"}
             yield {"type": "text_end"}
+            solver_out = (result.get("stdout") or "")[-1500:]
+            yield {"type": "node_result", "ok": False, "kind": "error",
+                   "error": f"CalculiX 求解失败：{err}",
+                   "diagnostics": {"material": material, "total_force_z": total_force_z,
+                                   "fix_nodes": n_fix, "load_nodes": n_load,
+                                   "solver_stdout_tail": solver_out}}
             return
 
         metrics = result["metrics"]
         max_disp = metrics["max_displacement_mm"]
         max_vm   = metrics["max_von_mises_mpa"]
+
+        yield {"type": "thinking_start"}
+        yield {"type": "thinking_delta", "text": (
+            f"求解收敛，已解析 .frd 结果。\n"
+            f"最大位移 {max_disp:.4g} mm，最大 Von Mises 应力 {max_vm:.4g} MPa。\n"
+            f"结果指标已写入上下文，供后处理(POST)生成云图与报告。"
+        )}
+        yield {"type": "thinking_end"}
 
         summary = (
             f"分析完成：\n"
@@ -132,3 +207,16 @@ class CAESpecialist(SpecialistAgent):
             "filename": Path(result["frd_path"]).name,
             "kind": "result",
         }
+
+        # Solved cleanly — but hand the metrics to the quality gate (LLM review)
+        # which judges whether the result is physically reasonable.
+        bbox = mesh_result.get("bounding_box", [])
+        yield {"type": "node_result", "ok": True, "kind": "quality",
+               "diagnostics": {
+                   "max_displacement_mm": max_disp,
+                   "max_von_mises_mpa": max_vm,
+                   "material": material,
+                   "total_force_z": total_force_z,
+                   "n_nodes": len(metrics.get("nodes", {})),
+                   "bounding_box": bbox,
+               }}

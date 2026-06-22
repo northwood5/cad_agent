@@ -10,6 +10,7 @@ export class Tabs {
       workflow: document.getElementById('tab-workflow'),
       viewer:   document.getElementById('tab-viewer'),
       scripts:  document.getElementById('tab-scripts'),
+      preview:  document.getElementById('tab-preview'),
     };
     this._current = 'workflow';
     this._onSwitch = null;

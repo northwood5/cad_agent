@@ -18,12 +18,14 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -35,6 +37,7 @@ from agents.cad import SUPPORTED_PROVIDERS
 from db import init_db, repository as repo
 from services.session_service import SessionManager, ProjectSession
 from services.workflow_service import WorkflowService, WorkflowController
+from services.run_manager import RunManager
 
 # ── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR     = Path(__file__).parent.parent
@@ -42,6 +45,10 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 CONFIG_PATH  = BASE_DIR / "backend" / "config" / "llm_config.yaml"
 OUTPUT_DIR   = BASE_DIR / "backend" / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Load secrets from a gitignored .env (if present) before reading the config, so
+# API keys live in the environment rather than in the committed/tracked tree.
+load_dotenv(BASE_DIR / ".env")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,6 +67,7 @@ def _load_config() -> dict[str, Any]:
         "anthropic": "ANTHROPIC_API_KEY",
         "dashscope": "DASHSCOPE_API_KEY",
         "deepseek":  "DEEPSEEK_API_KEY",
+        "zhipu":     "ZHIPU_API_KEY",
     }
     for provider, env_var in env_map.items():
         val = os.environ.get(env_var, "")
@@ -80,11 +88,21 @@ _config: dict[str, Any] = _load_config()
 
 def _active_llm_cfg() -> dict[str, Any]:
     provider = _config.get("active_provider", "openai")
-    return dict(_config["providers"][provider])
+    cfg = dict(_config["providers"][provider])
+    # Surface workflow-level settings alongside the provider config so the
+    # WorkflowService/ReviewAgent can read them (e.g. self-heal iteration budget).
+    if "max_repair_iterations" in _config:
+        cfg["max_repair_iterations"] = _config["max_repair_iterations"]
+    return cfg
 
 
 # ── Session registry (per project) ──────────────────────────────────────────
 session_manager = SessionManager()
+
+# Connection-independent registry of in-flight workflow runs. Keeping a run here
+# (rather than in the WebSocket handler's local state) lets a refreshed/reconnected
+# page reattach to a run that is still executing instead of cancelling it.
+run_manager = RunManager()
 
 
 def _project_workspace(project_id: int) -> Path:
@@ -115,38 +133,31 @@ async def ws_chat(websocket: WebSocket, project_id: int):
     await websocket.accept()
     logger.info("WS connected: project=%s", project_id)
 
-    send_lock = asyncio.Lock()
+    # The run lives in the connection-independent registry, not here, so this
+    # socket can drop (page refresh) without cancelling the workflow.
+    active_run = run_manager.get_or_create(project_id)
 
-    async def send(payload: dict) -> None:
-        async with send_lock:
-            await websocket.send_json(payload)
+    # Subscribe BEFORE snapshotting the log: subscription + snapshot happen with
+    # no await between them, and _broadcast appends+enqueues atomically per loop
+    # tick — so events emitted during replay land in the queue (not the snapshot),
+    # giving exactly-once delivery with no gap.
+    queue = active_run.subscribe()
+    replay: list[dict] = list(active_run.event_log) if active_run.running else []
 
-    # One persistent WorkflowService per connection so reset/rerun can target
-    # the last plan; the current run task + controller live alongside it.
-    state: dict[str, Any] = {"service": None, "task": None, "controller": None}
+    async def drain() -> None:
+        """Forward live events from this connection's queue to the socket."""
+        while True:
+            ev = await queue.get()
+            await websocket.send_json(ev)
 
-    def busy() -> bool:
-        t = state["task"]
-        return t is not None and not t.done()
+    # Rebuild the in-flight view on (re)connect, then go live via the queue.
+    if replay:
+        await websocket.send_json({"type": "replay_start"})
+        for ev in replay:
+            await websocket.send_json(ev)
+        await websocket.send_json({"type": "replay_end"})
 
-    async def run_stream(gen) -> None:
-        """Drive a workflow generator, stream events, persist the reply."""
-        await send({"type": "agent_start"})
-        reply_buf: list[str] = []
-        try:
-            async for payload in gen:
-                if payload.get("type") == "text_delta":
-                    reply_buf.append(payload.get("text", ""))
-                await send(payload)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.exception("Workflow error  project=%s", project_id)
-            await send({"type": "error", "message": str(exc)})
-        reply_text = "".join(reply_buf).strip()
-        if reply_text:
-            repo.add_message(project_id, "agent", reply_text)
-        await send({"type": "agent_done"})
+    sender = asyncio.create_task(drain())
 
     try:
         while True:
@@ -160,73 +171,75 @@ async def ws_chat(websocket: WebSocket, project_id: int):
 
             # ── interrupt the running workflow ──
             if action == "interrupt":
-                if state["controller"] is not None:
-                    state["controller"].interrupt()
+                active_run.interrupt()
                 continue
 
             # ── reset / rerun from a node (original instruction) ──
             if action == "reset_node":
-                if busy() or state["service"] is None:
+                if active_run.busy or active_run.service is None:
                     continue
                 node_id = data.get("node_id")
                 if not node_id:
                     continue
                 ctrl = WorkflowController()
-                state["controller"] = ctrl
-                gen = state["service"].rerun_from(node_id, ctrl)
-                state["task"] = asyncio.create_task(run_stream(gen))
+                active_run.controller = ctrl
+                active_run.start(active_run.service.rerun_from(node_id, ctrl))
                 continue
 
             # ── rerun a node with a new natural-language instruction ──
             if action == "reset_node_with_instruction":
-                if busy() or state["service"] is None:
+                if active_run.busy or active_run.service is None:
                     continue
                 node_id = data.get("node_id")
                 instruction = (data.get("instruction") or "").strip()
                 if not node_id or not instruction:
                     continue
                 ctrl = WorkflowController()
-                state["controller"] = ctrl
-                gen = state["service"].rerun_from(node_id, ctrl, override_instruction=instruction)
-                state["task"] = asyncio.create_task(run_stream(gen))
+                active_run.controller = ctrl
+                active_run.start(
+                    active_run.service.rerun_from(node_id, ctrl, override_instruction=instruction)
+                )
                 continue
 
             # ── set a breakpoint on a workflow node ──
             if action == "set_breakpoint":
                 node_id = data.get("node_id")
-                if node_id and state["controller"] is not None:
-                    state["controller"].set_breakpoint(node_id)
+                if node_id and active_run.controller is not None:
+                    active_run.controller.set_breakpoint(node_id)
                 continue
 
             # ── remove a breakpoint from a workflow node ──
             if action == "remove_breakpoint":
                 node_id = data.get("node_id")
-                if node_id and state["controller"] is not None:
-                    state["controller"].remove_breakpoint(node_id)
+                if node_id and active_run.controller is not None:
+                    active_run.controller.remove_breakpoint(node_id)
                 continue
 
             # ── resume a node paused at a breakpoint ──
             if action == "resume_node":
                 node_id = data.get("node_id")
                 instruction = (data.get("instruction") or "").strip() or None
-                if node_id and state["controller"] is not None:
-                    state["controller"].resume(node_id, instruction)
+                if node_id and active_run.controller is not None:
+                    active_run.controller.resume(node_id, instruction)
                 continue
 
             # ── reset project session (clears in-memory geometry state) ──
             if action == "new_session":
-                if busy() and state["controller"] is not None:
-                    state["controller"].interrupt()
+                # Interrupt any running workflow but keep the ActiveRun (and its
+                # subscribers/queue) so this and other tabs stay attached. A stale
+                # event_log won't replay since `running` flips False once stopped,
+                # and the next chat clears it.
+                active_run.interrupt()
+                active_run.service = None
                 session_manager.drop(project_id)
                 _get_session(project_id)
-                state["service"] = None
-                await send({"type": "session_ready", "session_id": project_id})
+                await websocket.send_json({"type": "session_ready", "session_id": project_id})
                 continue
 
             if action != "chat":
                 continue
 
-            if busy():
+            if active_run.busy:
                 continue  # ignore new requests while a workflow runs
 
             user_text: str = data.get("text", "").strip()
@@ -248,17 +261,17 @@ async def ws_chat(websocket: WebSocket, project_id: int):
 
             repo.add_message(project_id, "user", user_text)
 
-            state["service"] = WorkflowService(session, _active_llm_cfg())
+            active_run.service = WorkflowService(session, _active_llm_cfg())
             ctrl = WorkflowController()
-            state["controller"] = ctrl
-            gen = state["service"].execute(user_text, scene_state, ctrl)
-            state["task"] = asyncio.create_task(run_stream(gen))
+            active_run.controller = ctrl
+            active_run.start(active_run.service.execute(user_text, scene_state, ctrl))
 
     except WebSocketDisconnect:
         logger.info("WS disconnected: project=%s", project_id)
-        t = state["task"]
-        if t is not None and not t.done():
-            t.cancel()
+        # Detach this connection only — the run keeps executing and a reconnect
+        # will replay the buffered events to catch up.
+        active_run.unsubscribe(queue)
+        sender.cancel()
 
 
 # ── REST: LLM config ────────────────────────────────────────────────────────
@@ -305,6 +318,7 @@ async def update_config(body: dict):
         logger.warning("Config save failed: %s", e)
 
     session_manager.clear()   # recreate sessions with new model on next request
+    run_manager.clear()       # interrupt in-flight runs bound to the old model
     return JSONResponse({
         "status": "ok",
         "active_provider": _config["active_provider"],
@@ -325,18 +339,151 @@ async def get_scene_shapes(project_id: int):
 
 # ── REST: model file download ───────────────────────────────────────────────
 
-@app.get("/api/models/{project_id}/{filename}")
-async def serve_model(project_id: int, filename: str):
-    filepath = OUTPUT_DIR / str(project_id) / filename
-    if not filepath.exists():
+@app.api_route("/api/models/{project_id}/{filepath:path}", methods=["GET", "HEAD"])
+async def serve_model(project_id: int, filepath: str):
+    # Prevent path traversal
+    base = (OUTPUT_DIR / str(project_id)).resolve()
+    target = (base / filepath).resolve()
+    if not str(target).startswith(str(base)):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if not target.exists():
         return JSONResponse({"error": "not found"}, status_code=404)
-    _media_map = {".stl": "model/stl", ".obj": "model/obj", ".step": "application/step", ".stp": "application/step"}
-    media = _media_map.get(Path(filename).suffix.lower(), "application/octet-stream")
+    filename = target.name
+    _media_map = {
+        ".stl": "model/stl", ".obj": "model/obj",
+        ".step": "application/step", ".stp": "application/step",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
+        ".html": "text/html", ".htm": "text/html",
+    }
+    media = _media_map.get(target.suffix.lower(), "application/octet-stream")
+    # Use inline disposition so browsers (and Three.js FileLoader) can read the
+    # response body directly; attachment disposition interferes with XHR in some
+    # configurations.
     return FileResponse(
-        str(filepath),
+        str(target),
         media_type=media,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
     )
+
+
+# ── REST: project file management ───────────────────────────────────────────
+
+def _build_file_tree(base_dir: Path) -> list[dict]:
+    """Recursively list files and dirs under *base_dir*, returning relative paths."""
+    if not base_dir.exists():
+        return []
+
+    def _scan(directory: Path) -> list[dict]:
+        items: list[dict] = []
+        try:
+            entries = sorted(directory.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
+        except PermissionError:
+            return items
+        for entry in entries:
+            if entry.name.startswith('.') or entry.name.startswith('__'):
+                continue
+            rel = entry.relative_to(base_dir)
+            if entry.is_dir():
+                items.append({
+                    "name": entry.name,
+                    "type": "dir",
+                    "path": rel.as_posix(),
+                    "children": _scan(entry),
+                })
+            else:
+                items.append({
+                    "name": entry.name,
+                    "type": "file",
+                    "path": rel.as_posix(),
+                    "size": entry.stat().st_size,
+                    "ext": entry.suffix.lower(),
+                })
+        return items
+
+    return _scan(base_dir)
+
+
+@app.get("/api/projects/{project_id}/files")
+async def get_project_files(project_id: int):
+    project_dir = OUTPUT_DIR / str(project_id)
+    return JSONResponse({"files": _build_file_tree(project_dir)})
+
+
+@app.get("/api/projects/{project_id}/latest-stl")
+async def get_latest_stl(project_id: int):
+    """Return the URL of the most recently modified STL file in the project."""
+    project_dir = OUTPUT_DIR / str(project_id)
+    if not project_dir.exists():
+        return JSONResponse({"url": None})
+    stl_files = sorted(
+        project_dir.rglob("*.stl"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not stl_files:
+        return JSONResponse({"url": None})
+    rel = stl_files[0].relative_to(project_dir).as_posix()
+    return JSONResponse({
+        "url":      f"/api/models/{project_id}/{rel}",
+        "filename": stl_files[0].name,
+        "path":     rel,
+    })
+
+
+@app.get("/api/projects/{project_id}/file-content")
+async def get_file_content(project_id: int, path: str):
+    base = (OUTPUT_DIR / str(project_id)).resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base)):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if not target.exists() or not target.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ext = target.suffix.lower()
+    _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp"}
+    _HTML_EXTS  = {".html", ".htm"}
+    _TEXT_EXTS  = {".py", ".txt", ".md", ".step", ".stp", ".inp", ".log",
+                   ".json", ".yaml", ".yml", ".sh", ".csv", ".geo", ".cfg",
+                   ".stl", ".obj"}
+    # Images: return a URL the browser can use directly in <img>
+    if ext in _IMAGE_EXTS:
+        url = f"/api/models/{project_id}/{path}"
+        return JSONResponse({"encoding": "image", "url": url})
+    # HTML: return content as html encoding for sandboxed <iframe srcdoc>
+    if ext in _HTML_EXTS:
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+            return JSONResponse({"encoding": "html", "content": content})
+        except Exception as exc:
+            return JSONResponse({"encoding": "binary", "content": None, "error": str(exc)})
+    if ext not in _TEXT_EXTS:
+        return JSONResponse({"encoding": "binary", "content": None})
+    try:
+        raw = target.read_bytes()
+        truncated = len(raw) > 1_000_000
+        if truncated:
+            raw = raw[:1_000_000]
+        content = raw.decode("utf-8", errors="replace")
+        if truncated:
+            content += "\n\n… (文件过大，已截断显示前 1 MB)"
+        return JSONResponse({"encoding": "text", "content": content})
+    except Exception as exc:
+        return JSONResponse({"encoding": "binary", "content": None, "error": str(exc)})
+
+
+@app.delete("/api/projects/{project_id}/files")
+async def delete_project_file(project_id: int, path: str):
+    base = (OUTPUT_DIR / str(project_id)).resolve()
+    target = (base / path).resolve()
+    if not str(target).startswith(str(base)):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    if not target.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if target.is_file():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    return JSONResponse({"status": "ok"})
 
 
 # ── REST: on-demand STEP export ─────────────────────────────────────────────
@@ -426,6 +573,11 @@ async def patch_project(project_id: int, body: dict):
 @app.delete("/api/projects/{project_id}")
 async def remove_project(project_id: int):
     repo.delete_project(project_id)
+    session_manager.drop(project_id)
+    run_manager.drop(project_id)
+    project_dir = OUTPUT_DIR / str(project_id)
+    if project_dir.exists():
+        shutil.rmtree(project_dir, ignore_errors=True)
     return JSONResponse({"status": "ok"})
 
 

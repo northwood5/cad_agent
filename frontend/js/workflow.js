@@ -8,6 +8,7 @@
  *   workflow_node_reset          { run_id, node_id }
  *   workflow_node_paused         { run_id, node_id, agent, title }
  *   workflow_node_instruction_updated { run_id, node_id, instruction }
+ *   workflow_loopback            { run_id, from_node, to_node, target_agent, reason, instruction, iteration }
  *   workflow_done                { run_id, status }
  *
  * Actions sent upstream via callbacks:
@@ -340,6 +341,43 @@ export class WorkflowView {
     if (!n) return;
     n.data.instruction = instruction;
     if (this._activeDetailId === nodeId) this._showDetail(nodeId);
+  }
+
+  /**
+   * Visualise a self-healing loop-back: the workflow rolled back from
+   * `fromId` to the upstream `toId` to re-run with a corrective instruction.
+   * Shows an iteration badge on the target node and pulses it.
+   */
+  markLoopback(fromId, toId, info = {}) {
+    const target = this._nodes[toId];
+    if (!target) return;
+    target.data.loopback = {
+      iteration: info.iteration, reason: info.reason,
+      from: fromId, instruction: info.instruction,
+    };
+
+    // Iteration badge on the target pipe node.
+    let badge = target.pipeEl.querySelector('.wfg-loop-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'wfg-loop-badge';
+      badge.style.cssText =
+        'position:absolute;top:-6px;right:-6px;min-width:18px;height:18px;' +
+        'padding:0 4px;border-radius:9px;background:#f5a623;color:#1a1200;' +
+        'font:700 11px/18px monospace;text-align:center;z-index:3;' +
+        'box-shadow:0 0 6px rgba(245,166,35,.7)';
+      target.pipeEl.style.position = 'relative';
+      target.pipeEl.appendChild(badge);
+    }
+    badge.textContent = `↺${info.iteration || ''}`;
+    badge.title = `自愈回退 #${info.iteration || ''}：${info.reason || ''}`;
+
+    // Pulse + scroll into view so the user notices the rollback.
+    target.pipeEl.animate(
+      [{ filter: 'brightness(1)' }, { filter: 'brightness(1.8)' }, { filter: 'brightness(1)' }],
+      { duration: 700, iterations: 2 },
+    );
+    target.pipeEl.scrollIntoView({ inline: 'center', behavior: 'smooth' });
   }
 }
 

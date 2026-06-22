@@ -11,6 +11,9 @@ import { Tabs }         from './tabs.js';
 import { WorkflowView } from './workflow.js?v=8';
 import { ScriptsView }  from './scripts.js?v=6';
 import { UserManager }  from './user.js';
+import { FileManager }  from './file_manager.js?v=2';
+import { TextPreview }  from './text_preview.js?v=3';
+import { initResizable } from './resizable.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const viewerWrap      = document.getElementById('viewer-canvas-wrap');
@@ -31,6 +34,7 @@ const llmBadge        = document.getElementById('llm-badge');
 const llmBadgeText    = document.getElementById('llm-badge-text');
 const downloadStlBtn  = document.getElementById('btn-download-stl');
 const downloadStepBtn = document.getElementById('btn-download-step');
+const reloadModelBtn  = document.getElementById('btn-reload-model');
 const historyToggle   = document.getElementById('btn-history-toggle');
 const historyPanel    = document.getElementById('history-panel');
 const historyClose    = document.getElementById('history-close');
@@ -49,15 +53,31 @@ const scripts  = new ScriptsView(
   document.getElementById('scripts-placeholder'),
 );
 const user     = new UserManager();
+const fileManager = new FileManager(
+  document.getElementById('fm-tree-root'),
+  document.getElementById('fm-refresh'),
+  {
+    onSwitchProject: (id) => user.switchToProject(id),
+    onProjectDeleted: async (id) => {
+      // Reload projects in the header selector after deletion.
+      await user.reloadProjects();
+    },
+  }
+);
+const textPreview = new TextPreview(
+  document.getElementById('preview-drop-zone'),
+  document.getElementById('preview-empty'),
+);
 let   viewer   = null;
 
 let PROJECT_ID = null;
 let ws         = null;
 let agentBusy  = false;
+let replaying  = false;   // true while a reconnect replays a still-running workflow
 
 async function initViewer() {
   try {
-    const { Viewer3D } = await import('./viewer3d.js');
+    const { Viewer3D } = await import('./viewer3d.js?v=3');
     viewer = new Viewer3D(viewerWrap);
     trace.addInfo('3D 渲染器就绪');
   } catch (e) {
@@ -67,8 +87,33 @@ async function initViewer() {
   }
 }
 
-// When the viewer becomes visible after being hidden, fix its size.
-tabs.onSwitch((name) => { if (name === 'viewer' && viewer) viewer.resetView(); });
+// When the viewer tab becomes visible: resize, and auto-load if a URL is known.
+tabs.onSwitch((name) => {
+  if (name !== 'viewer' || !viewer) return;
+  viewer.resetView();
+  // If a model URL is known but no geometry is currently displayed, load it.
+  if (_currentModelUrl && !viewer.hasModel()) {
+    requestAnimationFrame(() => viewer.loadSTL(_currentModelUrl));
+  }
+});
+
+// Allow dropping a file directly onto the "文件预览" tab button to auto-switch.
+const previewTabBtn = document.querySelector('[data-tab="preview"]');
+if (previewTabBtn) {
+  previewTabBtn.addEventListener('dragover', e => {
+    if (e.dataTransfer.types.includes('application/x-cad-file')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  previewTabBtn.addEventListener('drop', async e => {
+    e.preventDefault();
+    const raw = e.dataTransfer.getData('application/x-cad-file');
+    if (!raw) return;
+    tabs.show('preview');
+    await textPreview.loadFile(JSON.parse(raw));
+  });
+}
 
 // Per-node controls: interrupt / reset / reset-with-instruction / breakpoint / resume.
 workflow.onInterrupt((nodeId) => {
@@ -206,6 +251,19 @@ function connectWS(projectId) {
 function handleEvent(evt) {
   switch (evt.type) {
 
+    // ── Reconnect replay: a still-running workflow is being rebuilt ──
+    // The chat (incl. the in-flight user message) and scripts are already
+    // restored from the DB by loadProjectHistory; only the workflow graph and
+    // reasoning trace need a clean slate before the buffered events replay.
+    case 'replay_start':
+      replaying = true;
+      workflow.clear();
+      trace.clear();
+      break;
+    case 'replay_end':
+      replaying = false;
+      break;
+
     case 'agent_start':
       agentBusy = true;
       setSendEnabled(false);
@@ -218,6 +276,8 @@ function handleEvent(evt) {
       setSendEnabled(true);
       trace.onAgentDone();
       chat.finaliseAgentStream();
+      // Refresh file sidebar so newly generated files appear immediately.
+      if (PROJECT_ID != null) fileManager.refreshProject(PROJECT_ID);
       break;
 
     // Final natural-language reply lives ONLY in the chat panel (the trace
@@ -254,6 +314,17 @@ function handleEvent(evt) {
     case 'workflow_node_instruction_updated':
       workflow.updateNodeInstruction(evt.node_id, evt.instruction);
       break;
+    case 'workflow_loopback':
+      workflow.markLoopback(evt.from_node, evt.to_node, {
+        iteration: evt.iteration, reason: evt.reason, instruction: evt.instruction,
+      });
+      trace.addInfo(
+        `↺ 自愈回退 #${evt.iteration}：${(evt.from_node || '')} → ${(evt.to_node || '')}` +
+        ` (${(evt.target_agent || '').toUpperCase()})  ${evt.reason || ''}`,
+      );
+      chat.addSystem(`自愈中（第 ${evt.iteration} 轮）：回退到 ${(evt.target_agent || '').toUpperCase()} 重做 — ${evt.reason || ''}`);
+      tabs.notify('workflow');
+      break;
     case 'workflow_done':
       trace.addInfo(`工作流结束：${evt.status}`);
       break;
@@ -267,14 +338,15 @@ function handleEvent(evt) {
     // ── Model (Tab 2) ──
     case 'model_ready':
       addToHistory({ filename: evt.filename, url: evt.url, timestamp: now() });
-      // Auto-switch to the viewer tab so the model appears immediately.
-      tabs.show('viewer');
+      // During a reconnect replay, rebuild history/viewer silently — don't yank
+      // the active tab or re-post chat notices for every buffered model.
+      if (!replaying) tabs.show('viewer');
       if (viewer && evt.filename && evt.filename.endsWith('.stl')) {
         // Defer by one frame so the tab is fully visible before the renderer
         // measures its container dimensions and the STL fetch begins.
         requestAnimationFrame(() => viewer.loadSTL(evt.url));
       }
-      chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
+      if (!replaying) chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
       break;
 
     case 'error':
@@ -360,6 +432,41 @@ newSessionBtn.addEventListener('click', () => {
   ws.send(JSON.stringify({ action: 'new_session' }));
 });
 
+// ── Load / refresh 3D model ────────────────────────────────────────────────────
+async function loadLatestModel() {
+  if (!viewer || PROJECT_ID == null) return;
+
+  // If we already have a URL from this session, use it directly.
+  if (_currentModelUrl) {
+    tabs.show('viewer');
+    viewer.loadSTL(_currentModelUrl);
+    return;
+  }
+
+  // Otherwise query the backend for the most recently modified STL in the project.
+  reloadModelBtn.disabled = true;
+  reloadModelBtn.textContent = '查找中…';
+  try {
+    const res  = await fetch(`/api/projects/${PROJECT_ID}/latest-stl`);
+    const data = await res.json();
+    if (data.url) {
+      tabs.show('viewer');
+      viewer.loadSTL(data.url);
+      // Register it so future clicks and history work correctly.
+      addToHistory({ filename: data.filename, url: data.url, timestamp: now() });
+    } else {
+      chat.addSystem('当前项目暂无 STL 模型文件，请先运行 CAD 建模。');
+    }
+  } catch (e) {
+    chat.addSystem(`加载模型失败：${e.message}`);
+  } finally {
+    reloadModelBtn.disabled = false;
+    reloadModelBtn.textContent = '↺ 加载模型';
+  }
+}
+
+reloadModelBtn.addEventListener('click', loadLatestModel);
+
 resetViewBtn.addEventListener('click', () => { if (viewer) viewer.resetView(); });
 traceClear.addEventListener('click', () => trace.clear());
 
@@ -367,6 +474,9 @@ traceClear.addEventListener('click', () => trace.clear());
 user.onProjectChange(async (projectId) => {
   PROJECT_ID = projectId;
   setSendEnabled(false);
+  // Sync sidebar project list (in case projects were added/deleted externally).
+  if (user.userId != null) await fileManager.reload(user.userId);
+  fileManager.setActiveProject(projectId);
   await loadProjectHistory(projectId);
   connectWS(projectId);
 });
@@ -454,10 +564,13 @@ saveConfigBtn.addEventListener('click', async () => {
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
+initResizable();
 setSendEnabled(false);
 chat.addSystem('正在初始化…');
 initViewer();
-user.init();
+user.init().then(() => {
+  if (user.userId != null) fileManager.loadUser(user.userId);
+});
 fetchConfig().then(cfg => {
   if (!cfg) return;
   _cfg = cfg;

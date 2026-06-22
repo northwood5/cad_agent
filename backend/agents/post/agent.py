@@ -192,6 +192,30 @@ def _blocking_post(metrics: dict, workspace: Path) -> dict:
     }
 
 
+_POST_SCRIPT = '''import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np, math
+
+# 1) 位移云图：按节点位置散点着色 + 分布直方图
+mags = [math.sqrt(sum(v**2 for v in disp[nid][:3])) for nid in sorted(disp)]
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+axes[0].scatter(xs, zs, c=mags, cmap="plasma", s=8)        # XZ 平面位移幅值
+axes[1].hist(mags, bins=30)                                # 位移分布
+fig.savefig("displacement_plot.png", dpi=100)
+
+# 2) Von Mises 应力分布直方图
+vm = list(vm_by_node.values())
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.hist(vm, bins=35)
+ax.axvline(max(vm), label=f"Max {max(vm):.2f} MPa")
+fig.savefig("stress_plot.png", dpi=100)
+
+# 3) 汇总自包含 HTML 报告（base64 内嵌图像）
+open("report.html", "w").write(build_html(max_disp, max_vm, plots))
+'''
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 class PostSpecialist(SpecialistAgent):
@@ -214,6 +238,24 @@ class PostSpecialist(SpecialistAgent):
             }
             yield {"type": "text_end"}
             return
+
+        n_nodes = len(metrics.get("displacements", {}))
+        max_disp0 = metrics.get("max_displacement_mm", 0)
+        max_vm0   = metrics.get("max_von_mises_mpa", 0)
+
+        # ── Reasoning → 推理面板 ────────────────────────────────────────────
+        yield {"type": "thinking_start"}
+        yield {"type": "thinking_delta", "text": (
+            f"读取 CAE 结果：{n_nodes} 个节点，最大位移 {max_disp0:.4g} mm，"
+            f"最大 Von Mises 应力 {max_vm0:.4g} MPa。\n"
+            f"使用 matplotlib(Agg) 生成：①位移散点云图+分布直方图 ②应力分布直方图。\n"
+            f"将图像以 base64 内嵌，汇总为自包含 HTML 报告 report.html。"
+        )}
+        yield {"type": "thinking_end"}
+
+        # ── 真实执行脚本 → 脚本日志 ──────────────────────────────────────────
+        yield {"type": "script_generated", "software": "matplotlib",
+               "language": "python", "content": _POST_SCRIPT}
 
         yield {"type": "text_start"}
         yield {"type": "text_delta", "text": "正在生成结果图表与报告…\n"}

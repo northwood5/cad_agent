@@ -27,9 +27,12 @@ _executor = concurrent.futures.ThreadPoolExecutor(
     max_workers=1, thread_name_prefix="ccx"
 )
 
-CCX_BIN = str(Path(sys.prefix) / "bin" / "ccx")
-if not os.path.exists(CCX_BIN):
-    CCX_BIN = "ccx"  # rely on PATH
+# Prefer the known cax conda location, then the active venv, then PATH.
+_CCX_CANDIDATES = [
+    "/home/ubuntu/miniforge3/envs/cax/bin/ccx",
+    str(Path(sys.prefix) / "bin" / "ccx"),
+]
+CCX_BIN = next((p for p in _CCX_CANDIDATES if os.path.exists(p)), "ccx")
 
 
 # ── CalculiX .inp writer ──────────────────────────────────────────────────────
