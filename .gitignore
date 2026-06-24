@@ -13,9 +13,16 @@ env/
 # ── CAD output (generated files, not source) ────────────────────────────────
 backend/output/
 
+# ── SQLite database (runtime data, not source) ──────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+
 # ── API Keys / secrets ──────────────────────────────────────────────────────
 .env
 .env.*
+# keep the committable template
+!.env.example
 backend/config/llm_config.yaml
 
 # ── OS / editor ──────────────────────────────────────────────────────────────

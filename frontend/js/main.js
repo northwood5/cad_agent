@@ -1,16 +1,19 @@
 /**
- * main.js — 入口：WebSocket、聊天、3D 预览、Agent 推理、LLM 设置、模型历史
+ * main.js — entry point.
  *
- * viewer3d.js 动态加载（本地 Three.js，不阻断主模块链）
- * chat.js / agent_trace.js 同步 import（纯本地，无外部依赖）
+ * Wires together: user/project management, WebSocket event stream, chat,
+ * the three graphics tabs (workflow / 3D viewer / scripts), the agent trace
+ * panel, and the LLM settings modal.
  */
-
-import { ChatPanel }  from './chat.js';
-import { AgentTrace } from './agent_trace.js';
-
-// ── Session ID ───────────────────────────────────────────────────────────────
-let SESSION_ID = sessionStorage.getItem('cad_session_id') || crypto.randomUUID();
-sessionStorage.setItem('cad_session_id', SESSION_ID);
+import { ChatPanel }    from './chat.js';
+import { AgentTrace }   from './agent_trace.js';
+import { Tabs }         from './tabs.js';
+import { WorkflowView } from './workflow.js?v=8';
+import { ScriptsView }  from './scripts.js?v=6';
+import { UserManager }  from './user.js';
+import { FileManager }  from './file_manager.js?v=2';
+import { TextPreview }  from './text_preview.js?v=3';
+import { initResizable } from './resizable.js';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const viewerWrap      = document.getElementById('viewer-canvas-wrap');
@@ -31,19 +34,50 @@ const llmBadge        = document.getElementById('llm-badge');
 const llmBadgeText    = document.getElementById('llm-badge-text');
 const downloadStlBtn  = document.getElementById('btn-download-stl');
 const downloadStepBtn = document.getElementById('btn-download-step');
+const reloadModelBtn  = document.getElementById('btn-reload-model');
 const historyToggle   = document.getElementById('btn-history-toggle');
 const historyPanel    = document.getElementById('history-panel');
 const historyClose    = document.getElementById('history-close');
 const historyList     = document.getElementById('history-list');
 
 // ── Instances ─────────────────────────────────────────────────────────────────
-const chat  = new ChatPanel(chatMsgsEl);
-const trace = new AgentTrace(traceLogEl, traceDotEl);
-let   viewer = null;
+const chat     = new ChatPanel(chatMsgsEl);
+const trace    = new AgentTrace(traceLogEl, traceDotEl);
+const tabs     = new Tabs();
+const workflow = new WorkflowView(
+  document.getElementById('workflow-canvas'),
+  document.getElementById('workflow-placeholder'),
+);
+const scripts  = new ScriptsView(
+  document.getElementById('scripts-list'),
+  document.getElementById('scripts-placeholder'),
+);
+const user     = new UserManager();
+const fileManager = new FileManager(
+  document.getElementById('fm-tree-root'),
+  document.getElementById('fm-refresh'),
+  {
+    onSwitchProject: (id) => user.switchToProject(id),
+    onProjectDeleted: async (id) => {
+      // Reload projects in the header selector after deletion.
+      await user.reloadProjects();
+    },
+  }
+);
+const textPreview = new TextPreview(
+  document.getElementById('preview-drop-zone'),
+  document.getElementById('preview-empty'),
+);
+let   viewer   = null;
+
+let PROJECT_ID = null;
+let ws         = null;
+let agentBusy  = false;
+let replaying  = false;   // true while a reconnect replays a still-running workflow
 
 async function initViewer() {
   try {
-    const { Viewer3D } = await import('./viewer3d.js');
+    const { Viewer3D } = await import('./viewer3d.js?v=3');
     viewer = new Viewer3D(viewerWrap);
     trace.addInfo('3D 渲染器就绪');
   } catch (e) {
@@ -52,22 +86,69 @@ async function initViewer() {
     if (ph) ph.innerHTML = '<div class="icon">⚠</div><div>3D 预览加载失败</div>';
   }
 }
-initViewer();
 
-// ── Model history (P7) ───────────────────────────────────────────────────────
-let _currentModelUrl = null;        // URL of the latest model for download
-let _modelHistory    = [];          // [{filename, url, timestamp}, ...]
+// When the viewer tab becomes visible: resize, and auto-load if a URL is known.
+tabs.onSwitch((name) => {
+  if (name !== 'viewer' || !viewer) return;
+  viewer.resetView();
+  // If a model URL is known but no geometry is currently displayed, load it.
+  if (_currentModelUrl && !viewer.hasModel()) {
+    requestAnimationFrame(() => viewer.loadSTL(_currentModelUrl));
+  }
+});
+
+// Allow dropping a file directly onto the "文件预览" tab button to auto-switch.
+const previewTabBtn = document.querySelector('[data-tab="preview"]');
+if (previewTabBtn) {
+  previewTabBtn.addEventListener('dragover', e => {
+    if (e.dataTransfer.types.includes('application/x-cad-file')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  previewTabBtn.addEventListener('drop', async e => {
+    e.preventDefault();
+    const raw = e.dataTransfer.getData('application/x-cad-file');
+    if (!raw) return;
+    tabs.show('preview');
+    await textPreview.loadFile(JSON.parse(raw));
+  });
+}
+
+// Per-node controls: interrupt / reset / reset-with-instruction / breakpoint / resume.
+workflow.onInterrupt((nodeId) => {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ action: 'interrupt' }));
+});
+workflow.onReset((nodeId) => {
+  if (agentBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'reset_node', node_id: nodeId }));
+});
+workflow.onResetWithInstruction((nodeId, instruction) => {
+  if (agentBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'reset_node_with_instruction', node_id: nodeId, instruction }));
+});
+workflow.onBreakpointToggle((nodeId, enabled) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({
+    action: enabled ? 'set_breakpoint' : 'remove_breakpoint',
+    node_id: nodeId,
+  }));
+});
+workflow.onResume((nodeId, instruction) => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'resume_node', node_id: nodeId, instruction: instruction || null }));
+});
+
+// ── Model history (per project) ────────────────────────────────────────────────
+let _currentModelUrl = null;
+let _modelHistory    = [];
 
 function addToHistory(entry) {
   _modelHistory.push(entry);
   _currentModelUrl = entry.url;
-
-  // Enable download buttons
   downloadStlBtn.disabled = false;
   downloadStlBtn.title = `下载 ${entry.filename}`;
   downloadStepBtn.disabled = false;
-
-  // Re-render history list
   renderHistory();
 }
 
@@ -77,7 +158,6 @@ function renderHistory() {
     return;
   }
   historyList.innerHTML = '';
-  // Show newest first
   [..._modelHistory].reverse().forEach((item, i) => {
     const isLatest = (i === 0);
     const div = document.createElement('div');
@@ -87,12 +167,10 @@ function renderHistory() {
       <div class="history-item-time">${item.timestamp}</div>
       <a class="history-item-dl" href="${item.url}" download="${item.filename}">⬇ 下载</a>
     `;
-    // Click to load this version in viewer
     div.addEventListener('click', (e) => {
-      if (e.target.tagName === 'A') return;   // let download link work
-      if (viewer) viewer.loadSTL(item.url);
+      if (e.target.tagName === 'A') return;
+      if (viewer && item.filename.endsWith('.stl')) viewer.loadSTL(item.url);
       _currentModelUrl = item.url;
-      // Highlight active
       historyList.querySelectorAll('.history-item').forEach(el => el.classList.remove('active'));
       div.classList.add('active');
     });
@@ -100,7 +178,6 @@ function renderHistory() {
   });
 }
 
-// ── History panel toggle ───────────────────────────────────────────────────
 historyToggle.addEventListener('click', () => {
   historyPanel.classList.toggle('hidden');
   historyToggle.classList.toggle('active');
@@ -110,7 +187,7 @@ historyClose.addEventListener('click', () => {
   historyToggle.classList.remove('active');
 });
 
-// ── Download STL ──────────────────────────────────────────────────────────────
+// ── Downloads ───────────────────────────────────────────────────────────────
 downloadStlBtn.addEventListener('click', () => {
   if (!_currentModelUrl) return;
   const a = document.createElement('a');
@@ -119,14 +196,13 @@ downloadStlBtn.addEventListener('click', () => {
   a.click();
 });
 
-// ── Download STEP ─────────────────────────────────────────────────────────────
 downloadStepBtn.addEventListener('click', async () => {
-  if (downloadStepBtn.disabled) return;
+  if (downloadStepBtn.disabled || PROJECT_ID == null) return;
   const orig = downloadStepBtn.textContent;
   downloadStepBtn.textContent = '导出中…';
   downloadStepBtn.disabled = true;
   try {
-    const res = await fetch(`/api/sessions/${SESSION_ID}/export/step`);
+    const res = await fetch(`/api/sessions/${PROJECT_ID}/export/step`);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
       chat.addSystem(`STEP 导出失败: ${err.error || res.statusText}`);
@@ -135,7 +211,7 @@ downloadStepBtn.addEventListener('click', async () => {
     const blob = await res.blob();
     const disp = res.headers.get('Content-Disposition') || '';
     const match = disp.match(/filename="([^"]+)"/);
-    const fname = match ? match[1] : `export_${SESSION_ID.slice(0, 8)}.step`;
+    const fname = match ? match[1] : `export_${PROJECT_ID}.step`;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -151,25 +227,20 @@ downloadStepBtn.addEventListener('click', async () => {
   }
 });
 
-// ── WebSocket ──────────────────────────────────────────────────────────────────
-let ws        = null;
-let agentBusy = false;
-let _wsReady  = false;
-
-function connectWS() {
+// ── WebSocket (per project) ────────────────────────────────────────────────────
+function connectWS(projectId) {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (_) {} }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/chat/${SESSION_ID}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws/chat/${projectId}`);
 
   ws.onopen = () => {
-    _wsReady = true;
     setSendEnabled(true);
-    trace.addInfo(`已连接  session=${SESSION_ID.slice(0, 8)}…`);
+    trace.addInfo(`已连接  项目 #${projectId}`);
   };
   ws.onclose = () => {
-    _wsReady = false;
     setSendEnabled(false);
     trace.addInfo('连接断开，3s 后重连…');
-    setTimeout(connectWS, 3000);
+    setTimeout(() => { if (PROJECT_ID === projectId) connectWS(projectId); }, 3000);
   };
   ws.onerror  = () => trace.addInfo('WebSocket 连接错误');
   ws.onmessage = ({ data }) => {
@@ -179,6 +250,19 @@ function connectWS() {
 
 function handleEvent(evt) {
   switch (evt.type) {
+
+    // ── Reconnect replay: a still-running workflow is being rebuilt ──
+    // The chat (incl. the in-flight user message) and scripts are already
+    // restored from the DB by loadProjectHistory; only the workflow graph and
+    // reasoning trace need a clean slate before the buffered events replay.
+    case 'replay_start':
+      replaying = true;
+      workflow.clear();
+      trace.clear();
+      break;
+    case 'replay_end':
+      replaying = false;
+      break;
 
     case 'agent_start':
       agentBusy = true;
@@ -192,20 +276,77 @@ function handleEvent(evt) {
       setSendEnabled(true);
       trace.onAgentDone();
       chat.finaliseAgentStream();
+      // Refresh file sidebar so newly generated files appear immediately.
+      if (PROJECT_ID != null) fileManager.refreshProject(PROJECT_ID);
       break;
 
+    // Final natural-language reply lives ONLY in the chat panel (the trace
+    // panel is reserved for reasoning internals to avoid duplication).
+    case 'text_start':
+    case 'text_end':
+      break;   // chat stream is bracketed by agent_start / agent_done
     case 'text_delta':
       chat.appendAgentText(evt.text);
-      trace.onEvent(evt);
       break;
 
+    // ── Workflow (Tab 1) ──
+    case 'workflow_plan':
+      workflow.renderPlan(evt);
+      tabs.notify('workflow');
+      break;
+    case 'workflow_node_start':
+      workflow.setNodeStatus(evt.node_id, 'running');
+      // Section header in the trace so tool events can be attributed to a node.
+      trace.addInfo(`▶ ${(evt.agent || '').toUpperCase()}：${evt.title || evt.node_id}`);
+      tabs.notify('workflow');
+      break;
+    case 'workflow_node_done':
+      workflow.setNodeDone(evt.node_id, evt.status, evt.summary, evt.artifacts);
+      break;
+    case 'workflow_node_reset':
+      workflow.setNodeStatus(evt.node_id, 'pending');
+      break;
+    case 'workflow_node_paused':
+      workflow.setNodePaused(evt.node_id);
+      trace.addInfo(`⏸ 断点暂停：${(evt.agent || '').toUpperCase()} — ${evt.title || evt.node_id}`);
+      tabs.show('workflow');
+      break;
+    case 'workflow_node_instruction_updated':
+      workflow.updateNodeInstruction(evt.node_id, evt.instruction);
+      break;
+    case 'workflow_loopback':
+      workflow.markLoopback(evt.from_node, evt.to_node, {
+        iteration: evt.iteration, reason: evt.reason, instruction: evt.instruction,
+      });
+      trace.addInfo(
+        `↺ 自愈回退 #${evt.iteration}：${(evt.from_node || '')} → ${(evt.to_node || '')}` +
+        ` (${(evt.target_agent || '').toUpperCase()})  ${evt.reason || ''}`,
+      );
+      chat.addSystem(`自愈中（第 ${evt.iteration} 轮）：回退到 ${(evt.target_agent || '').toUpperCase()} 重做 — ${evt.reason || ''}`);
+      tabs.notify('workflow');
+      break;
+    case 'workflow_done':
+      trace.addInfo(`工作流结束：${evt.status}`);
+      break;
+
+    // ── Script log (Tab 3) ──
+    case 'script_generated':
+      scripts.add(evt);
+      tabs.notify('scripts');
+      break;
+
+    // ── Model (Tab 2) ──
     case 'model_ready':
-      // Load into 3D viewer + update history
-      if (viewer) viewer.loadSTL(evt.url);
-      addToHistory({ filename: evt.filename, url: evt.url, timestamp: evt.timestamp || now() });
-      downloadStepBtn.disabled = false;
-      chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
-      trace.onEvent(evt);
+      addToHistory({ filename: evt.filename, url: evt.url, timestamp: now() });
+      // During a reconnect replay, rebuild history/viewer silently — don't yank
+      // the active tab or re-post chat notices for every buffered model.
+      if (!replaying) tabs.show('viewer');
+      if (viewer && evt.filename && evt.filename.endsWith('.stl')) {
+        // Defer by one frame so the tab is fully visible before the renderer
+        // measures its container dimensions and the STL fetch begins.
+        requestAnimationFrame(() => viewer.loadSTL(evt.url));
+      }
+      if (!replaying) chat.addSystem(`3D 模型已更新 ↗  ${evt.filename}`);
       break;
 
     case 'error':
@@ -213,24 +354,29 @@ function handleEvent(evt) {
       setSendEnabled(true);
       chat.finaliseAgentStream();
       chat.addSystem(`错误: ${evt.message}`);
-      trace.onEvent(evt);
       break;
 
     case 'session_ready':
-      chat.clear();
-      if (viewer) viewer.clearModel();
-      trace.clear();
-      _modelHistory = [];
-      _currentModelUrl = null;
-      downloadStlBtn.disabled = true;
-      downloadStepBtn.disabled = true;
-      renderHistory();
-      trace.addInfo(`新会话  session=${evt.session_id.slice(0, 8)}…`);
+      resetProjectUI();
+      trace.addInfo(`场景已清空  项目 #${evt.session_id}`);
       break;
 
     default:
       trace.onEvent(evt);
   }
+}
+
+function resetProjectUI() {
+  chat.clear();
+  if (viewer) viewer.clearModel();
+  trace.clear();
+  workflow.clear();
+  scripts.clear();
+  _modelHistory = [];
+  _currentModelUrl = null;
+  downloadStlBtn.disabled = true;
+  downloadStepBtn.disabled = true;
+  renderHistory();
 }
 
 function now() {
@@ -240,6 +386,25 @@ function now() {
 function setSendEnabled(on) {
   sendBtn.disabled  = !on;
   chatInput.disabled = !on;
+}
+
+// ── Load a project's persisted history ──────────────────────────────────────────
+async function loadProjectHistory(projectId) {
+  resetProjectUI();
+  try {
+    const [msgs, scr] = await Promise.all([
+      fetch(`/api/projects/${projectId}/messages`).then(r => r.json()),
+      fetch(`/api/projects/${projectId}/scripts`).then(r => r.json()),
+    ]);
+    (msgs.messages || []).forEach(m => {
+      if (m.role === 'user') chat.addUser(m.content);
+      else if (m.role === 'agent') { chat.startAgentStream(); chat.appendAgentText(m.content); chat.finaliseAgentStream(); }
+      else chat.addSystem(m.content);
+    });
+    if (scr.scripts && scr.scripts.length) scripts.hydrate(scr.scripts);
+  } catch (e) {
+    console.warn('loadProjectHistory:', e.message);
+  }
 }
 
 // ── Send message ──────────────────────────────────────────────────────────────
@@ -261,28 +426,62 @@ chatInput.addEventListener('input', () => {
   chatInput.style.height = Math.min(chatInput.scrollHeight, 120) + 'px';
 });
 
-// ── New session ────────────────────────────────────────────────────────────────
+// ── Clear scene (within current project) ───────────────────────────────────────
 newSessionBtn.addEventListener('click', () => {
-  if (agentBusy) return;
-  SESSION_ID = crypto.randomUUID();
-  sessionStorage.setItem('cad_session_id', SESSION_ID);
-  if (ws) ws.close();
-  // Wait for ws.onclose to fire → reconnect → then notify server
-  const poll = setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      clearInterval(poll);
-      ws.send(JSON.stringify({ action: 'new_session' }));
-    }
-  }, 150);
+  if (agentBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ action: 'new_session' }));
 });
 
-// ── Reset view ─────────────────────────────────────────────────────────────────
-resetViewBtn.addEventListener('click', () => { if (viewer) viewer.resetView(); });
+// ── Load / refresh 3D model ────────────────────────────────────────────────────
+async function loadLatestModel() {
+  if (!viewer || PROJECT_ID == null) return;
 
-// ── Trace clear ────────────────────────────────────────────────────────────────
+  // If we already have a URL from this session, use it directly.
+  if (_currentModelUrl) {
+    tabs.show('viewer');
+    viewer.loadSTL(_currentModelUrl);
+    return;
+  }
+
+  // Otherwise query the backend for the most recently modified STL in the project.
+  reloadModelBtn.disabled = true;
+  reloadModelBtn.textContent = '查找中…';
+  try {
+    const res  = await fetch(`/api/projects/${PROJECT_ID}/latest-stl`);
+    const data = await res.json();
+    if (data.url) {
+      tabs.show('viewer');
+      viewer.loadSTL(data.url);
+      // Register it so future clicks and history work correctly.
+      addToHistory({ filename: data.filename, url: data.url, timestamp: now() });
+    } else {
+      chat.addSystem('当前项目暂无 STL 模型文件，请先运行 CAD 建模。');
+    }
+  } catch (e) {
+    chat.addSystem(`加载模型失败：${e.message}`);
+  } finally {
+    reloadModelBtn.disabled = false;
+    reloadModelBtn.textContent = '↺ 加载模型';
+  }
+}
+
+reloadModelBtn.addEventListener('click', loadLatestModel);
+
+resetViewBtn.addEventListener('click', () => { if (viewer) viewer.resetView(); });
 traceClear.addEventListener('click', () => trace.clear());
 
-// ── LLM badge (P6) ────────────────────────────────────────────────────────────
+// ── Project switching ───────────────────────────────────────────────────────────
+user.onProjectChange(async (projectId) => {
+  PROJECT_ID = projectId;
+  setSendEnabled(false);
+  // Sync sidebar project list (in case projects were added/deleted externally).
+  if (user.userId != null) await fileManager.reload(user.userId);
+  fileManager.setActiveProject(projectId);
+  await loadProjectHistory(projectId);
+  connectWS(projectId);
+});
+
+// ── LLM badge + settings modal ──────────────────────────────────────────────────
 function updateBadge(provider, model) {
   if (!provider) { llmBadgeText.textContent = '—'; llmBadge.classList.add('inactive'); return; }
   llmBadgeText.textContent = `${provider} / ${model || '?'}`;
@@ -290,24 +489,14 @@ function updateBadge(provider, model) {
 }
 
 async function fetchConfig() {
-  try {
-    const res = await fetch('/api/config');
-    return await res.json();
-  } catch (e) {
-    console.warn('fetchConfig:', e.message);
-    return null;
-  }
+  try { return await (await fetch('/api/config')).json(); }
+  catch (e) { console.warn('fetchConfig:', e.message); return null; }
 }
 
-// ── Settings modal (P6) ───────────────────────────────────────────────────────
 let _cfg = null;
-
 settingsBtn.addEventListener('click', () => {
-  // Open immediately — don't await
   modalOverlay.classList.add('open');
-  fetchConfig().then(cfg => {
-    if (cfg) { _cfg = cfg; populateForm(cfg); }
-  });
+  fetchConfig().then(cfg => { if (cfg) { _cfg = cfg; populateForm(cfg); } });
 });
 
 function closeModal() { modalOverlay.classList.remove('open'); }
@@ -316,16 +505,15 @@ modalCancelBtn.addEventListener('click', closeModal);
 modalOverlay.addEventListener('click', e => { if (e.target === modalOverlay) closeModal(); });
 
 function populateForm(cfg) {
-  const sel     = document.getElementById('cfg-provider');
+  const sel = document.getElementById('cfg-provider');
   const modelEl = document.getElementById('cfg-model');
-  const baseEl  = document.getElementById('cfg-baseurl');
+  const baseEl = document.getElementById('cfg-baseurl');
   const statusEl = document.getElementById('cfg-status');
-
   sel.value = cfg.active_provider || 'openai';
   const pCfg = (cfg.providers || {})[cfg.active_provider] || {};
   modelEl.value = pCfg.model_name || '';
   baseEl.value  = pCfg.base_url   || '';
-  document.getElementById('cfg-apikey').value = '';  // never pre-fill
+  document.getElementById('cfg-apikey').value = '';
   if (statusEl) {
     statusEl.textContent = pCfg.has_api_key ? '已配置' : '未配置';
     statusEl.className = `status-badge ${pCfg.has_api_key ? 'badge-ok' : 'badge-err'}`;
@@ -351,13 +539,11 @@ saveConfigBtn.addEventListener('click', async () => {
   const modelName = document.getElementById('cfg-model').value.trim();
   const apiKey    = document.getElementById('cfg-apikey').value.trim();
   const baseUrl   = document.getElementById('cfg-baseurl').value.trim() || null;
-
   const body = {
     active_provider: provider,
     provider_config: { model_name: modelName, base_url: baseUrl },
   };
   if (apiKey) body.provider_config.api_key = apiKey;
-
   try {
     const res  = await fetch('/api/config', {
       method: 'POST',
@@ -378,12 +564,13 @@ saveConfigBtn.addEventListener('click', async () => {
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
+initResizable();
 setSendEnabled(false);
-downloadStepBtn.disabled = true;
-chat.addSystem('正在连接服务…');
-connectWS();
-
-// Load config and update badge
+chat.addSystem('正在初始化…');
+initViewer();
+user.init().then(() => {
+  if (user.userId != null) fileManager.loadUser(user.userId);
+});
 fetchConfig().then(cfg => {
   if (!cfg) return;
   _cfg = cfg;

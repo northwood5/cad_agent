@@ -1,8 +1,15 @@
+# NOTE: FreeCAD is NOT a pip package here — it is provided in-process by the
+# conda-forge build. Create the env first, then pip-install this file into it:
+#   conda create -y -n cax -c conda-forge python=3.11 freecad
+#   conda run -n cax pip install -r backend/requirements.txt
+# Run via ./start.sh (uses ~/miniforge3/envs/cax).
+
 agentscope>=2.0.2
 fastapi>=0.137.0
 uvicorn[standard]>=0.29.0
 websockets>=12.0
 pyyaml>=6.0
+python-dotenv>=1.0.0
 python-multipart>=0.0.9
 trimesh>=4.0.0
 manifold3d>=3.5.0

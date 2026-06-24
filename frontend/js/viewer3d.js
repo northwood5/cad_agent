@@ -82,6 +82,7 @@ export class Viewer3D {
   }
 
   loadSTL(url) {
+    this._setStatus('loading');
     const loader = new STLLoader();
     loader.load(
       url,
@@ -93,12 +94,11 @@ export class Viewer3D {
           this._mesh = null;
         }
         geometry.computeVertexNormals();
-        // Silver metallic: high shininess + near-white specular
         const mat = new THREE.MeshPhongMaterial({
-          color:    0xc8ccd4,   // silver-white base
-          specular: 0xffffff,   // pure white highlight
+          color:    0xc8ccd4,
+          specular: 0xffffff,
           shininess: 320,
-          emissive:  0x0a0c10,  // faint dark self-glow for depth
+          emissive:  0x0a0c10,
           side: THREE.DoubleSide,
         });
         this._mesh = new THREE.Mesh(geometry, mat);
@@ -106,11 +106,13 @@ export class Viewer3D {
         this._mesh.receiveShadow = true;
         this._scene.add(this._mesh);
         this._fitCamera();
-        const ph = document.getElementById('viewer-placeholder');
-        if (ph) ph.classList.add('hidden');
+        this._setStatus('hidden');
       },
       undefined,
-      (err) => console.error('STL load error:', err)
+      (err) => {
+        console.error('STL load error:', err);
+        this._setStatus('error', url);
+      }
     );
   }
 
@@ -133,6 +135,8 @@ export class Viewer3D {
     this._controls.update();
   }
 
+  hasModel() { return this._mesh !== null; }
+
   resetView() { this._fitCamera(); }
 
   clearModel() {
@@ -142,7 +146,33 @@ export class Viewer3D {
       this._mesh.material.dispose();
       this._mesh = null;
     }
+    this._setStatus('visible');
+  }
+
+  _setStatus(state, url) {
     const ph = document.getElementById('viewer-placeholder');
-    if (ph) ph.classList.remove('hidden');
+    if (!ph) return;
+    const overlay = ph.querySelector('.viewer-status-overlay');
+    if (overlay) overlay.remove();
+
+    if (state === 'hidden') {
+      ph.classList.add('hidden');
+      return;
+    }
+    ph.classList.remove('hidden');
+    if (state === 'loading') {
+      const el = document.createElement('div');
+      el.className = 'viewer-status-overlay';
+      el.style.cssText = 'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(13,16,24,.85);pointer-events:none;';
+      el.innerHTML = '<div style="font-size:36px;animation:pulse 1.2s infinite">⧖</div><div>加载模型中…</div>';
+      ph.appendChild(el);
+    } else if (state === 'error') {
+      const el = document.createElement('div');
+      el.className = 'viewer-status-overlay';
+      el.style.cssText = 'position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:rgba(13,16,24,.85);pointer-events:none;';
+      el.innerHTML = `<div style="font-size:36px;opacity:.5">⚠</div><div style="color:#e05252">模型加载失败</div><div style="font-size:11px;opacity:.6;max-width:80%;text-align:center;word-break:break-all;">${url || ''}</div>`;
+      ph.appendChild(el);
+    }
+    // state === 'visible' → just show the original placeholder (done above)
   }
 }

@@ -11,23 +11,9 @@ from typing import Any
 
 from agentscope.agent import Agent, ReActConfig
 from agentscope.agent._config import ContextConfig
-from agentscope.model import (
-    ChatModelBase,
-    OpenAIChatModel,
-    AnthropicChatModel,
-    DashScopeChatModel,
-    OllamaChatModel,
-    DeepSeekChatModel,
-)
-from agentscope.credential import (
-    OpenAICredential,
-    AnthropicCredential,
-    DashScopeCredential,
-    OllamaCredential,
-    DeepSeekCredential,
-)
 from agentscope.tool import Toolkit
 
+from ..llm_factory import build_model, SUPPORTED_PROVIDERS  # re-exported for callers
 from .tools.cad_engine import CADScene
 from .tools.cad_tools import build_cad_toolkit
 
@@ -87,57 +73,6 @@ necessary operations (do not reset unless explicitly asked).
 """
 
 # ---------------------------------------------------------------------------
-# Model factory
-# ---------------------------------------------------------------------------
-
-SUPPORTED_PROVIDERS = ["openai", "anthropic", "dashscope", "ollama", "deepseek"]
-
-
-def build_model(config: dict[str, Any]) -> ChatModelBase:
-    """
-    Build an AgentScope ChatModelBase from a plain-dict config.
-
-    Config fields:
-        provider  : one of SUPPORTED_PROVIDERS
-        model_name: e.g. "gpt-4o", "claude-sonnet-4-6", "qwen-plus"
-        api_key   : (not needed for Ollama)
-        base_url  : optional override (OpenAI-compatible endpoints, Ollama host, …)
-        stream    : bool (default True)
-    """
-    provider = config.get("provider", "openai").lower()
-    model_name: str = config["model_name"]
-    api_key: str = config.get("api_key", "")
-    base_url: str | None = config.get("base_url") or None
-    stream: bool = config.get("stream", True)
-
-    if provider == "openai":
-        cred = OpenAICredential(api_key=api_key, base_url=base_url)
-        return OpenAIChatModel(credential=cred, model=model_name, stream=stream)
-
-    elif provider == "anthropic":
-        cred = AnthropicCredential(api_key=api_key, base_url=base_url)
-        return AnthropicChatModel(credential=cred, model=model_name, stream=stream)
-
-    elif provider == "dashscope":
-        cred = DashScopeCredential(api_key=api_key)
-        return DashScopeChatModel(credential=cred, model=model_name, stream=stream)
-
-    elif provider == "ollama":
-        host = base_url or "http://localhost:11434"
-        cred = OllamaCredential(host=host)
-        return OllamaChatModel(credential=cred, model=model_name, stream=stream)
-
-    elif provider == "deepseek":
-        cred = DeepSeekCredential(api_key=api_key)
-        return DeepSeekChatModel(credential=cred, model=model_name, stream=stream)
-
-    else:
-        raise ValueError(
-            f"Unknown provider '{provider}'. Supported: {SUPPORTED_PROVIDERS}"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Agent factory
 # ---------------------------------------------------------------------------
 
@@ -166,3 +101,61 @@ def build_agent(
         context_config=ContextConfig(tool_result_limit=30000),
     )
     return agent, scene
+
+
+# ---------------------------------------------------------------------------
+# Specialist wrapper (used by the orchestrator / workflow service)
+# ---------------------------------------------------------------------------
+
+from agentscope.message import UserMsg          # noqa: E402
+
+from ..base import SpecialistAgent, TaskContext  # noqa: E402
+
+
+class CADSpecialist(SpecialistAgent):
+    """Wraps the CAD Agent + scene so the orchestrator can drive it uniformly."""
+
+    name = "cad"
+    display_name = "CAD 设计"
+    capabilities = (
+        "根据自然语言创建/修改三维 CAD 几何：基本体(box/cylinder/sphere/cone/torus)、"
+        "布尔运算(并/差/交)、平移旋转缩放、多边形拉伸、圆角(FreeCAD)，"
+        "并可导出 STL / OBJ / STEP。适合一切实体建模与几何编辑任务。"
+    )
+    input_kinds = ["text"]
+    output_kinds = ["step", "stl", "obj"]
+
+    def __init__(self, llm_config: dict[str, Any], workspace: Path) -> None:
+        super().__init__(llm_config, workspace)
+        self.agent, self.scene = build_agent(llm_config, workspace)
+
+    async def run(self, instruction: str, context: TaskContext):
+        """Stream the CAD agent's reasoning for one workflow node."""
+        async for evt in self.agent.reply_stream(
+            UserMsg(name="user", content=instruction)
+        ):
+            yield evt
+        # Record the freshest exported artifact (if any) for downstream nodes.
+        for kind in ("step", "stl", "obj"):
+            matches = sorted(
+                self.workspace.glob(f"*.{kind}"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if matches:
+                context.record(kind, matches[0])
+        # Store bounding box size hint for the mesh agent's characteristic length.
+        shapes = self.scene.list_shapes()
+        if shapes.get("count", 0) > 0:
+            import math
+            all_bounds = [s["bounds"] for s in shapes["shapes"] if s.get("bounds")]
+            if all_bounds:
+                xs = [b[0][0] for b in all_bounds] + [b[1][0] for b in all_bounds]
+                ys = [b[0][1] for b in all_bounds] + [b[1][1] for b in all_bounds]
+                zs = [b[0][2] for b in all_bounds] + [b[1][2] for b in all_bounds]
+                bbox_size = math.sqrt(
+                    (max(xs) - min(xs)) ** 2
+                    + (max(ys) - min(ys)) ** 2
+                    + (max(zs) - min(zs)) ** 2
+                )
+                context.scratch["bbox_size"] = max(bbox_size, 1.0)

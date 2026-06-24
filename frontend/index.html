@@ -3,15 +3,25 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>CAD Agent</title>
+<title>CAx Agent</title>
 <link rel="icon" href="data:," />
-<link rel="stylesheet" href="/css/style.css" />
+<link rel="stylesheet" href="/css/style.css?v=12" />
 </head>
 <body>
 
 <!-- ═══════════════════ Header ═══════════════════ -->
 <header>
-  <h1><span>CAD</span> Agent</h1>
+  <h1><span>CAx</span> Agent</h1>
+
+  <!-- User + project selector -->
+  <div class="user-area">
+    <button class="user-chip" id="user-chip" title="切换用户">
+      <span class="user-icon">👤</span>
+      <span id="user-name">未登录</span>
+    </button>
+    <select id="project-select" class="project-select" title="切换项目"></select>
+    <button class="btn-sm" id="btn-new-project" title="新建项目">＋ 项目</button>
+  </div>
 
   <!-- Active LLM badge (populated by JS) -->
   <div id="llm-badge" class="llm-badge" title="当前使用的 LLM">
@@ -21,7 +31,7 @@
 
   <div class="header-btns">
     <button class="btn" id="btn-reset-view" title="重置 3D 视角">重置视角</button>
-    <button class="btn btn-danger" id="btn-new-session" title="清空场景并开始新会话">新会话</button>
+    <button class="btn btn-danger" id="btn-new-session" title="清空当前项目场景">清空场景</button>
     <button class="btn btn-primary" id="btn-settings">LLM 设置</button>
   </div>
 </header>
@@ -30,35 +40,98 @@
 <div class="main">
   <div class="work-area">
 
-    <!-- ── 3D Viewer ── -->
-    <div id="viewer-panel">
-      <div id="viewer-toolbar">
-        <span class="toolbar-hint">拖拽旋转 · 滚轮缩放 · 右键平移</span>
-        <div class="toolbar-actions">
-          <button class="btn-sm" id="btn-download-stl" disabled title="下载当前模型 STL">⬇ STL</button>
-          <button class="btn-sm" id="btn-download-step" disabled title="导出 STEP 文件（可用于 SolidWorks / Fusion 360 等 CAD 软件）">⬇ STEP</button>
-          <button class="btn-sm" id="btn-history-toggle" title="模型版本历史">历史</button>
-        </div>
+    <!-- ── File sidebar ── -->
+    <div id="file-sidebar">
+      <div class="fm-header">
+        <span class="fm-header-title">项目文件</span>
+        <button class="fm-refresh-btn" id="fm-refresh" title="刷新">↺</button>
       </div>
-      <div id="viewer-canvas-wrap">
-        <div id="viewer-placeholder">
-          <div class="icon">⬡</div>
-          <div>向 Agent 描述你想创建的 CAD 模型</div>
-          <div style="font-size:11px;opacity:.6">模型生成后将在此处显示</div>
+      <div id="fm-tree-root"></div>
+    </div>
+
+    <div class="resize-handle resize-h" id="resize-sidebar" title="拖动调整侧边栏宽度"></div>
+
+    <!-- ── Graphics work area (4 tabs) ── -->
+    <div id="viewer-panel">
+
+      <!-- Tab bar -->
+      <div id="tab-bar">
+        <button class="tab-btn active" data-tab="workflow">🧩 编排工作流</button>
+        <button class="tab-btn" data-tab="viewer">🧊 3D 视图</button>
+        <button class="tab-btn" data-tab="scripts">📜 脚本日志</button>
+        <button class="tab-btn" data-tab="preview">📄 文件预览</button>
+      </div>
+
+      <!-- Tab 1: Workflow orchestration -->
+      <div class="tab-pane active" id="tab-workflow">
+        <div id="workflow-canvas">
+          <div id="workflow-placeholder">
+            <div class="icon">&#x2B23;</div>
+            <div>描述你的 CAx 任务，Agent 将自动编排工作流</div>
+            <div style="font-size:11px;opacity:.6">CAD 建模 · 网格剖分 · 仿真分析 · 支持断点调试</div>
+          </div>
         </div>
       </div>
 
-      <!-- Model version history sidebar -->
-      <div id="history-panel" class="history-panel hidden">
-        <div class="history-header">
-          <span>模型历史</span>
-          <span id="history-close" class="history-close">×</span>
+      <!-- Tab 2: 3D viewer -->
+      <div class="tab-pane" id="tab-viewer">
+        <div id="viewer-toolbar">
+          <span class="toolbar-hint">拖拽旋转 · 滚轮缩放 · 右键平移</span>
+          <div class="toolbar-actions">
+            <button class="btn-sm btn-accent" id="btn-reload-model" title="加载或刷新 3D 模型">↺ 加载模型</button>
+            <button class="btn-sm" id="btn-download-stl" disabled title="下载当前模型 STL">⬇ STL</button>
+            <button class="btn-sm" id="btn-download-step" disabled title="导出 STEP 文件（可用于 SolidWorks / Fusion 360 等 CAD 软件）">⬇ STEP</button>
+            <button class="btn-sm" id="btn-history-toggle" title="模型版本历史">历史</button>
+          </div>
         </div>
-        <div id="history-list" class="history-list">
-          <div class="history-empty">暂无历史记录</div>
+        <div id="viewer-canvas-wrap">
+          <div id="viewer-placeholder">
+            <div class="icon">⬡</div>
+            <div>向 Agent 描述你想创建的 CAD 模型</div>
+            <div style="font-size:11px;opacity:.6">模型生成后将在此处显示</div>
+          </div>
+
+          <!-- Model version history sidebar -->
+          <div id="history-panel" class="history-panel hidden">
+            <div class="history-header">
+              <span>模型历史</span>
+              <span id="history-close" class="history-close">×</span>
+            </div>
+            <div id="history-list" class="history-list">
+              <div class="history-empty">暂无历史记录</div>
+            </div>
+          </div>
         </div>
       </div>
-    </div>
+
+      <!-- Tab 3: Script log -->
+      <div class="tab-pane" id="tab-scripts">
+        <div id="scripts-toolbar">
+          <span class="toolbar-hint">LLM 生成、发送给 CAx 软件的脚本</span>
+        </div>
+        <div id="scripts-list">
+          <div id="scripts-placeholder">
+            <div class="icon">📜</div>
+            <div>暂无脚本</div>
+            <div style="font-size:11px;opacity:.6">Agent 调用 FreeCAD / Gmsh 等软件时，脚本将记录在此</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 4: File preview -->
+      <div class="tab-pane" id="tab-preview">
+        <div id="preview-drop-zone">
+          <div id="preview-empty">
+            <div class="icon">📄</div>
+            <div>将左侧文件拖拽至此处预览</div>
+            <div style="font-size:11px;opacity:.6">支持文本、图片（PNG/JPG/SVG）、HTML 等格式</div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- #viewer-panel -->
+
+    <div class="resize-handle resize-h" id="resize-chat" title="拖动调整聊天栏宽度"></div>
 
     <!-- ── Chat panel ── -->
     <div id="chat-panel">
@@ -66,7 +139,7 @@
       <div id="chat-input-bar">
         <textarea
           id="chat-input"
-          placeholder="描述你想要的 CAD 模型… (Enter 发送，Shift+Enter 换行)"
+          placeholder="描述你想要的 CAx 任务… (Enter 发送，Shift+Enter 换行)"
           rows="1"
         ></textarea>
         <button id="send-btn" title="发送 (Enter)">
@@ -76,6 +149,8 @@
     </div>
 
   </div><!-- .work-area -->
+
+  <div class="resize-handle resize-v" id="resize-trace" title="拖动调整推理面板高度"></div>
 
   <!-- ── Agent Trace ── -->
   <div id="trace-panel">
@@ -87,6 +162,24 @@
     <div id="trace-log"></div>
   </div>
 </div><!-- .main -->
+
+<!-- ═══════════════════ New-Project Modal ═══════════════════ -->
+<div class="modal-overlay" id="modal-new-project">
+  <div class="modal" style="width:360px">
+    <div class="modal-title-row">
+      <h2>新建项目</h2>
+      <span class="modal-close" id="new-project-close">×</span>
+    </div>
+    <div class="form-row">
+      <label>项目名称</label>
+      <input id="new-project-name" type="text" placeholder="未命名项目" autocomplete="off" />
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="new-project-cancel">取消</button>
+      <button class="btn btn-primary" id="new-project-confirm">创建</button>
+    </div>
+  </div>
+</div>
 
 <!-- ═══════════════════ Settings Modal ═══════════════════ -->
 <div class="modal-overlay" id="modal-settings">
@@ -101,6 +194,7 @@
       <select id="cfg-provider">
         <option value="openai">OpenAI  (gpt-4o / gpt-4.1 …)</option>
         <option value="anthropic">Anthropic  (Claude Sonnet / Opus …)</option>
+        <option value="zhipu">智谱 AI  (GLM-5 / GLM-4 …)</option>
         <option value="dashscope">DashScope  (Qwen-plus / Qwen-max …)</option>
         <option value="deepseek">DeepSeek  (deepseek-chat / reasoner …)</option>
         <option value="ollama">Ollama  (本地部署)</option>
@@ -125,7 +219,7 @@
     <div class="form-row">
       <label>Base URL &nbsp;<small style="color:var(--text-muted)">(自定义端点 / Ollama 主机)</small></label>
       <input id="cfg-baseurl" type="text"
-        placeholder="留空使用默认  |  Ollama: http://localhost:11434" />
+        placeholder="留空使用默认  |  Ollama: http://localhost:11434  |  智谱: https://open.bigmodel.cn/api/paas/v4/" />
     </div>
 
     <div class="modal-actions">
@@ -135,6 +229,6 @@
   </div>
 </div>
 
-<script type="module" src="/js/main.js?v=3"></script>
+<script type="module" src="/js/main.js?v=12"></script>
 </body>
 </html>
